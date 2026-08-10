@@ -5,11 +5,74 @@
 #include <opencv2/calib3d.hpp>
 
 #include <iostream>
+#include <fstream>
+#include <sstream>
+#include <iomanip>
+#include <ctime>
+#include <chrono>
 #include <vector>
+#include <deque>
+#include <algorithm>
+#include <limits>
 #include <cmath>
 
+
 //--------------------------------------------------
-// DLP Model Listesi (SRS madde 8)
+// Debug / Verbose Logging
+//--------------------------------------------------
+
+bool g_verboseLog = false;
+
+//--------------------------------------------------
+// Timestamp Utility
+//--------------------------------------------------
+
+std::string nowTimestamp(const char* fmt)
+{
+    std::time_t t = std::time(nullptr);
+    std::tm tmBuf{};
+
+#if defined(_WIN32)
+    localtime_s(&tmBuf, &t);
+#else
+    localtime_r(&t, &tmBuf);
+#endif
+
+    std::ostringstream oss;
+    oss << std::put_time(&tmBuf, fmt);
+    return oss.str();
+}
+
+//--------------------------------------------------
+// Measurement Data
+//--------------------------------------------------
+
+struct MeasurementData
+{
+    double widthMM;
+    double heightMM;
+
+    cv::Point2d centerMM;
+
+    double pitch;
+    double roll;
+
+    double diagonalMM;
+    double perspectiveErrorPct;
+    double rotationDeg;
+
+    cv::RotatedRect rect;
+
+    bool valid;
+
+    bool poseValid;
+    bool mmValid;
+
+    bool sizeSuspicious;
+};
+
+//--------------------------------------------------
+// DLP Model Listesi
 //--------------------------------------------------
 
 struct DLPModel
@@ -41,13 +104,151 @@ DLPModel selectDLPModel()
     std::cout << "Secim (1-" << g_dlpModels.size() << "): ";
     std::cin >> choice;
 
-    if(choice < 1 || choice > static_cast<int>(g_dlpModels.size()))
+    if(std::cin.fail() || choice < 1 || choice > static_cast<int>(g_dlpModels.size()))
     {
+        std::cin.clear();
+        std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
         std::cout << "Gecersiz secim, varsayilan olarak ilk model kullanilacak." << std::endl;
         choice = 1;
     }
 
     return g_dlpModels[choice - 1];
+}
+
+//--------------------------------------------------
+// Test Deseni Secimi
+//--------------------------------------------------
+
+enum class TestPatternType
+{
+    WHITE_RECTANGLE,
+    FOUR_CORNER_MARKERS,
+    CROSS_LINES,
+    CALIBRATION_GRID
+};
+
+TestPatternType selectTestPattern()
+{
+    std::cout << "\n=== Test Deseni Secin ===" << std::endl;
+    std::cout << "1) Tam beyaz dikdortgen (uygulanmis)" << std::endl;
+    std::cout << "2) Dort kose markeri (henuz uygulanmadi)" << std::endl;
+    std::cout << "3) Capraz cizgiler (henuz uygulanmadi)" << std::endl;
+    std::cout << "4) Kalibrasyon gridi (henuz uygulanmadi)" << std::endl;
+
+    int choice = 0;
+    std::cout << "Secim (1-4): ";
+    std::cin >> choice;
+
+    if(std::cin.fail())
+    {
+        std::cin.clear();
+        std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+        choice = 1;
+    }
+
+    switch(choice)
+    {
+    case 2: return TestPatternType::FOUR_CORNER_MARKERS;
+    case 3: return TestPatternType::CROSS_LINES;
+    case 4: return TestPatternType::CALIBRATION_GRID;
+    default: return TestPatternType::WHITE_RECTANGLE;
+    }
+}
+
+//--------------------------------------------------
+// Alignment Tolerances
+//--------------------------------------------------
+
+const double CENTER_TOLERANCE_MM = 2.0;
+const double ANGLE_TOLERANCE_DEG = 1.0;
+const double SIZE_TOLERANCE_PCT  = 3.0;
+
+// FIX: olcum, secili DLP modelinin nominal boyutundan bu oranin
+// UZERINDE sapiyorsa artik "supheli/guvenilmez" sayilir (bkz.
+// asagidaki SIZE_SUSPICIOUS_PCT ve measureObject icindeki kontrol).
+const double SIZE_SUSPICIOUS_PCT = 35.0;
+
+enum class AlignmentStatus
+{
+    OK,
+    MOVE_LEFT,
+    MOVE_RIGHT,
+    MOVE_UP,
+    MOVE_DOWN,
+    MOVE_FORWARD,
+    MOVE_BACKWARD,
+    ROTATE_CW,
+    ROTATE_CCW,
+    NO_DATA,
+    STABILIZING,
+    SIZE_MISMATCH
+};
+
+AlignmentStatus g_status = AlignmentStatus::NO_DATA;
+
+//--------------------------------------------------
+// Reference Plane (A4)
+//--------------------------------------------------
+// NOT: Bu iki sabit main.cpp icinde artik DOGRUDAN hesaplamada kullanilmiyor
+// (bkz. updateAlignmentStatus() duzeltmesi) - burada sadece dunya (mm)
+// koordinat sisteminin ORIJININI belgelemek icin tutuluyor: (0,0) noktasi,
+// Homography.cpp'de tiklanan A4 kagidinin SOL-UST kosesidir. Gercek
+// homografi hesabi homography.cpp icinde A4_WIDTH/A4_HEIGHT ile yapilir.
+//
+// ONEMLI (kalibrasyon/olcum tutarliligi icin operasyonel kural):
+// A4 kagidi, Homography programi calistirilirken, DLP'nin projekte
+// edildigi/olculdugu YUZEYIN TAM UZERINE (ayni fiziksel duzleme) konmalidir.
+// Homografi TEK BIR duzlem icin gecerlidir; A4 kagidi farkli bir mesafede/
+// derinlikte (Z) tutulup DLP yuzeyi baska bir duzlemde olculuyorsa,
+// piksel->mm donusumu sistematik ve BUYUK hata verir (ekran goruntusundeki
+// "Width: 229mm / secilen model 124.8mm" gibi mantiksiz sonuclar tam olarak
+// bu sebepten olusur).
+
+const float A4_WIDTH  = 210.0f;
+const float A4_HEIGHT = 297.0f;
+
+//--------------------------------------------------
+// Alignment Status -> Metin / Renk
+//--------------------------------------------------
+
+std::string alignmentStatusToString(AlignmentStatus status)
+{
+    switch(status)
+    {
+    case AlignmentStatus::OK:            return "ALIGNMENT OK";
+    case AlignmentStatus::MOVE_LEFT:     return "MOVE PROJECTOR LEFT";
+    case AlignmentStatus::MOVE_RIGHT:    return "MOVE PROJECTOR RIGHT";
+    case AlignmentStatus::MOVE_UP:       return "MOVE PROJECTOR UP";
+    case AlignmentStatus::MOVE_DOWN:     return "MOVE PROJECTOR DOWN";
+    case AlignmentStatus::MOVE_FORWARD:  return "MOVE PROJECTOR FORWARD";
+    case AlignmentStatus::MOVE_BACKWARD: return "MOVE PROJECTOR BACKWARD";
+    case AlignmentStatus::ROTATE_CW:     return "ROTATE CW";
+    case AlignmentStatus::ROTATE_CCW:    return "ROTATE CCW";
+    case AlignmentStatus::STABILIZING:   return "STABILIZING...";
+    case AlignmentStatus::SIZE_MISMATCH: return "SIZE MISMATCH - CHECK SETUP";
+    case AlignmentStatus::NO_DATA:
+    default:                             return "NO DATA";
+    }
+}
+
+cv::Scalar alignmentStatusToColor(AlignmentStatus status)
+{
+    switch(status)
+    {
+    case AlignmentStatus::OK:            return cv::Scalar(0,255,0);
+    case AlignmentStatus::MOVE_LEFT:
+    case AlignmentStatus::MOVE_RIGHT:
+    case AlignmentStatus::MOVE_UP:
+    case AlignmentStatus::MOVE_DOWN:     return cv::Scalar(0,255,255);
+    case AlignmentStatus::MOVE_FORWARD:
+    case AlignmentStatus::MOVE_BACKWARD: return cv::Scalar(255,0,255);
+    case AlignmentStatus::ROTATE_CW:
+    case AlignmentStatus::ROTATE_CCW:    return cv::Scalar(0,165,255);
+    case AlignmentStatus::STABILIZING:   return cv::Scalar(200,200,0);
+    case AlignmentStatus::SIZE_MISMATCH: return cv::Scalar(0,0,255);
+    case AlignmentStatus::NO_DATA:
+    default:                             return cv::Scalar(128,128,128);
+    }
 }
 
 //--------------------------------------------------
@@ -62,19 +263,13 @@ cv::Mat captureFrame(cv::VideoCapture& cap)
 }
 
 //--------------------------------------------------
-// Detect Bright Region (DLP projeksiyon deseni icin)
+// Detect Bright Region
 //--------------------------------------------------
-// Renk yerine parlaklik kontrasti kullanir. Gri seviyeye cevirir,
-// gurultuyu azaltmak icin hafif blur uygular, sonra trackbar ile
-// ayarlanan esik degerine gore parlak bolgeyi ayirir.
 
-int g_thresholdValue = 150; // trackbar ile canli ayarlanacak
+int g_thresholdValue = 150;
 
-cv::Mat detectBrightRegion(const cv::Mat& image)
+cv::Mat detectBrightRegion(const cv::Mat& gray)
 {
-    cv::Mat gray;
-    cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
-
     cv::Mat blurred;
     cv::GaussianBlur(gray, blurred, cv::Size(5, 5), 0);
 
@@ -133,16 +328,98 @@ int findLargestContour(
 }
 
 //--------------------------------------------------
-// Estimate Pose (Pitch / Roll) via solvePnP
+// Order Corners
 //--------------------------------------------------
-// imageCorners sirasi: rotated.points() ciktisi (4 nokta)
-// realWidth/realHeight: secilen DLP modelinin gercek boyutu (mm)
-// NOT: Bu ilk-versiyon; gercek DLP deseni entegre edildiginde
-// objectPoints sirasi ile imageCorners sirasinin eslesmesi
-// yeniden dogrulanmali (kose siralama tutarliligi kritik).
+
+std::vector<cv::Point2f> orderCorners(const cv::Point2f rawCorners[4])
+{
+    std::vector<cv::Point2f> pts(rawCorners, rawCorners + 4);
+    std::vector<cv::Point2f> ordered(4);
+
+    auto sumCmp  = [](const cv::Point2f& a, const cv::Point2f& b) { return (a.x + a.y) < (b.x + b.y); };
+    auto diffCmp = [](const cv::Point2f& a, const cv::Point2f& b) { return (a.x - a.y) < (b.x - b.y); };
+
+    ordered[0] = *std::min_element(pts.begin(), pts.end(), sumCmp);
+    ordered[2] = *std::max_element(pts.begin(), pts.end(), sumCmp);
+    ordered[1] = *std::max_element(pts.begin(), pts.end(), diffCmp);
+    ordered[3] = *std::min_element(pts.begin(), pts.end(), diffCmp);
+
+    return ordered;
+}
+
+//--------------------------------------------------
+// Refine Corners To Subpixel Accuracy
+//--------------------------------------------------
+
+std::vector<cv::Point2f> refineCornersSubPixel(
+    const cv::Mat& grayFrame,
+    const cv::Point2f rawCorners[4])
+{
+    std::vector<cv::Point2f> refined(rawCorners, rawCorners + 4);
+
+    if(grayFrame.empty())
+        return refined;
+
+    for(const auto& p : refined)
+    {
+        if(p.x < 0 ||
+           p.y < 0 ||
+           p.x >= grayFrame.cols ||
+           p.y >= grayFrame.rows)
+        {
+            return refined;
+        }
+    }
+
+    cv::cornerSubPix(
+        grayFrame,
+        refined,
+        cv::Size(5,5),
+        cv::Size(-1,-1),
+        cv::TermCriteria(
+            cv::TermCriteria::EPS +
+            cv::TermCriteria::COUNT,
+            30,
+            0.01));
+
+    return refined;
+}
+//--------------------------------------------------
+// Is Rectangular Contour
+//--------------------------------------------------
+
+bool isRectangularContour(
+    const std::vector<cv::Point>& contour,
+    double contourArea,
+    const cv::RotatedRect& rotated,
+    double minFillRatio = 0.85)
+{
+    double rectArea = static_cast<double>(rotated.size.width) * rotated.size.height;
+
+    if(rectArea < 1.0)
+        return false;
+
+    double fillRatio = contourArea / rectArea;
+
+    if(fillRatio < minFillRatio)
+        return false;
+
+    double peri = cv::arcLength(contour, true);
+    std::vector<cv::Point> approx;
+    cv::approxPolyDP(contour, approx, 0.03 * peri, true);
+
+    if(approx.size() < 4 || approx.size() > 6)
+        return false;
+
+    return true;
+}
+
+//--------------------------------------------------
+// Estimate Pose
+//--------------------------------------------------
 
 bool estimatePose(
-    const cv::Point2f imageCorners[4],
+    const std::vector<cv::Point2f>& orderedImageCorners,
     float realWidth,
     float realHeight,
     const cv::Mat& cameraMatrix,
@@ -153,6 +430,9 @@ bool estimatePose(
     if(cameraMatrix.empty() || distCoeffs.empty())
         return false;
 
+    if(orderedImageCorners.size() != 4)
+        return false;
+
     std::vector<cv::Point3f> objectPoints = {
         cv::Point3f(0.0f, 0.0f, 0.0f),
         cv::Point3f(realWidth, 0.0f, 0.0f),
@@ -160,13 +440,11 @@ bool estimatePose(
         cv::Point3f(0.0f, realHeight, 0.0f)
     };
 
-    std::vector<cv::Point2f> imgPts(imageCorners, imageCorners + 4);
-
     cv::Mat rvec, tvec;
 
     bool ok = cv::solvePnP(
         objectPoints,
-        imgPts,
+        orderedImageCorners,
         cameraMatrix,
         distCoeffs,
         rvec,
@@ -207,9 +485,10 @@ bool estimatePose(
 // Measure Object
 //--------------------------------------------------
 
-void measureObject(
+MeasurementData measureObject(
     const std::vector<std::vector<cv::Point>>& contours,
     int maxIndex,
+    const cv::Mat& grayFrame,
     const cv::Mat& homographyMatrix,
     bool homographyLoaded,
     const cv::Mat& cameraMatrix,
@@ -217,31 +496,122 @@ void measureObject(
     bool calibrationLoaded,
     const DLPModel& selectedModel)
 {
-    if(maxIndex == -1)
-        return;
+    MeasurementData measurement;
 
-    cv::Rect box = cv::boundingRect(contours[maxIndex]);
+    measurement.valid     = false;
+    measurement.poseValid = false;
+    measurement.mmValid   = false;
+    measurement.sizeSuspicious = false;
+
+    measurement.widthMM  = 0.0;
+    measurement.heightMM = 0.0;
+
+    measurement.centerMM = cv::Point2d(0.0, 0.0);
+
+    measurement.pitch = 0.0;
+    measurement.roll  = 0.0;
+
+    measurement.diagonalMM          = 0.0;
+    measurement.perspectiveErrorPct = 0.0;
+    measurement.rotationDeg         = 0.0;
+
+    if(maxIndex == -1)
+        return measurement;
+
+    static int s_warnThrottleFrames = 0;
+    const int WARN_THROTTLE_INTERVAL = 20;
+
+    auto printThrottled = [&](const std::string& msg)
+    {
+        if(s_warnThrottleFrames == 0)
+        {
+            std::cout << "\n[UYARI] " << msg << std::endl;
+            s_warnThrottleFrames = WARN_THROTTLE_INTERVAL;
+        }
+        else
+        {
+            s_warnThrottleFrames--;
+        }
+    };
+
     cv::RotatedRect rotated = cv::minAreaRect(contours[maxIndex]);
 
-    cv::Point2f imageCorners[4];
-    rotated.points(imageCorners);
+    double area = cv::contourArea(contours[maxIndex]);
 
-    std::vector<cv::Point2f> imagePoints(imageCorners, imageCorners + 4);
+    if(!grayFrame.empty())
+    {
+        cv::Rect boundingBox = cv::boundingRect(contours[maxIndex]);
+
+        double frameArea = static_cast<double>(grayFrame.cols) * grayFrame.rows;
+        double boxArea    = static_cast<double>(boundingBox.width) * boundingBox.height;
+
+        bool touchesAllEdges =
+            boundingBox.x <= 1 &&
+            boundingBox.y <= 1 &&
+            (boundingBox.x + boundingBox.width)  >= (grayFrame.cols - 1) &&
+            (boundingBox.y + boundingBox.height) >= (grayFrame.rows - 1);
+
+        bool coversFrame = (frameArea > 0.0) && ((boxArea / frameArea) > 0.90);
+
+        if(coversFrame || touchesAllEdges)
+        {
+            printThrottled(
+                "Tespit edilen parlak bolge kameranin goruntu cercevesinin neredeyse "
+                "TAMAMINI kapliyor - bu gercek bir DLP deseni degil, asiri pozlama / "
+                "cok dusuk threshold / fazla ortam isigi belirtisidir. Olcum atlandi. "
+                "'Mask (debug)' penceresindeki Threshold kaydiricisini YUKSELTIN veya "
+                "ortam isigini azaltin.");
+            return measurement;
+        }
+    }
+
+    if(!isRectangularContour(contours[maxIndex], area, rotated))
+    {
+        printThrottled("Bulunan kontur dikdortgen degil, olcum atlandi.");
+        return measurement;
+    }
+
+    s_warnThrottleFrames = 0;
+
+    measurement.rect  = rotated;
+    measurement.valid = true;
+
+    cv::Point2f rawCorners[4];
+    rotated.points(rawCorners);
+
+    std::vector<cv::Point2f> refinedCorners = refineCornersSubPixel(grayFrame, rawCorners);
+    cv::Point2f refinedArr[4];
+    for(int i = 0; i < 4; i++)
+        refinedArr[i] = refinedCorners[i];
+
+    std::vector<cv::Point2f> imageCorners = orderCorners(refinedArr);
+
     std::vector<cv::Point2f> worldPoints;
 
-    int centerX = box.x + box.width / 2;
-    int centerY = box.y + box.height / 2;
+    cv::Point2f centerPxF = rotated.center;
 
     double width  = rotated.size.width;
     double height = rotated.size.height;
 
-    double widthMM  = 0.0;
-    double heightMM = 0.0;
-    cv::Point2f centerMM(0.0f, 0.0f);
+    double angle = rotated.angle;
+
+    if(g_verboseLog)
+    {
+        std::cout << "\n=====================\n";
+        std::cout << "Area : " << area << std::endl;
+        std::cout << "Width (pixel) : " << width << std::endl;
+        std::cout << "Height (pixel) : " << height << std::endl;
+    }
+
+    {
+        cv::Point2f topEdge = imageCorners[1] - imageCorners[0];
+        double rotationRad = std::atan2(topEdge.y, topEdge.x);
+        measurement.rotationDeg = rotationRad * 180.0 / CV_PI;
+    }
 
     if(homographyLoaded && !homographyMatrix.empty())
     {
-        cv::perspectiveTransform(imagePoints, worldPoints, homographyMatrix);
+        cv::perspectiveTransform(imageCorners, worldPoints, homographyMatrix);
 
         if(worldPoints.size() == 4)
         {
@@ -253,52 +623,114 @@ void measureObject(
             double sideA = (d01 + d23) / 2.0;
             double sideB = (d12 + d30) / 2.0;
 
-            widthMM  = std::max(sideA, sideB);
-            heightMM = std::min(sideA, sideB);
+            measurement.widthMM  = std::max(sideA, sideB);
+            measurement.heightMM = std::min(sideA, sideB);
+
+            double diag02 = cv::norm(worldPoints[0] - worldPoints[2]);
+            double diag13 = cv::norm(worldPoints[1] - worldPoints[3]);
+            measurement.diagonalMM = (diag02 + diag13) / 2.0;
+
+            double horizKeystonePct = (sideA > 1e-6)
+                ? (std::abs(d01 - d23) / sideA) * 100.0
+                : 0.0;
+
+            double vertKeystonePct = (sideB > 1e-6)
+                ? (std::abs(d12 - d30) / sideB) * 100.0
+                : 0.0;
+
+            measurement.perspectiveErrorPct = std::max(horizKeystonePct, vertKeystonePct);
         }
 
-        std::vector<cv::Point2f> centerPx = { cv::Point2f((float)centerX, (float)centerY) };
+        std::vector<cv::Point2f> centerPx = { centerPxF };
         std::vector<cv::Point2f> centerWorld;
         cv::perspectiveTransform(centerPx, centerWorld, homographyMatrix);
 
         if(!centerWorld.empty())
-            centerMM = centerWorld[0];
-    }
+        {
+            measurement.centerMM = cv::Point2d(centerWorld[0].x, centerWorld[0].y);
+            measurement.mmValid  = true;
+        }
 
-    double angle = rotated.angle;
-    double area  = cv::contourArea(contours[maxIndex]);
+        // FIX (KRITIK - ekranda gorulen "Width:229mm vs secili model 124.8mm"
+        // gibi anlamsiz sonuclar): Olculen mm boyutu, secilen DLP modelinin
+        // nominal boyutundan buyuk oranda sapiyorsa bu artik SESSIZCE kabul
+        // edilmiyor. Boyle bir sapma tipik olarak iki nedenden biriyle olusur:
+        //   1) Homography.cpp'de A4 kagidi, DLP olcum yuzeyiyle AYNI fiziksel
+        //      duzlemde degildi (farkli mesafe/derinlik) - homografi sadece
+        //      TEK bir duzlem icin gecerlidir.
+        //   2) Threshold/kontur yanlis bir parlak bolgeyi (goruntunun tamami
+        //      degil ama yanlis nesneyi) yakalamis olabilir.
+        // Bu durumda pose (pitch/roll) hesaplamasi da anlamsiz cikar (asagida
+        // gorulecegi gibi artik olculen degil, NOMINAL boyut kullaniliyor -
+        // ama yine de operatoru bariz sekilde yanlis bir olcumle yonlendirmemek
+        // icin measurement "supheli" olarak isaretleniyor).
+        if(measurement.mmValid && selectedModel.widthMM > 1e-3f && selectedModel.heightMM > 1e-3f)
+        {
+            double wDiffPct = std::abs(measurement.widthMM  - selectedModel.widthMM)  / selectedModel.widthMM  * 100.0;
+            double hDiffPct = std::abs(measurement.heightMM - selectedModel.heightMM) / selectedModel.heightMM * 100.0;
 
-    std::cout << "\n=====================\n";
-    std::cout << "Area : " << area << std::endl;
-    std::cout << "Width (pixel) : " << width << std::endl;
-    std::cout << "Height (pixel) : " << height << std::endl;
+            if(wDiffPct > SIZE_SUSPICIOUS_PCT || hDiffPct > SIZE_SUSPICIOUS_PCT)
+            {
+                measurement.sizeSuspicious = true;
 
-    if(homographyLoaded && !homographyMatrix.empty())
-    {
-        std::cout << "Width (mm) : " << widthMM << std::endl;
-        std::cout << "Height (mm) : " << heightMM << std::endl;
-        std::cout << "Center (mm) : (" << centerMM.x << ", " << centerMM.y << ")" << std::endl;
+                printThrottled(
+                    "Olculen boyut (" + std::to_string(measurement.widthMM) + " x " +
+                    std::to_string(measurement.heightMM) + " mm), secilen DLP modelinin "
+                    "nominal boyutundan (" + selectedModel.name + ") %35'ten fazla sapiyor. "
+                    "Olasi nedenler: (1) Homography programinda A4 kagidi, DLP olcum "
+                    "yuzeyiyle AYNI fiziksel duzlemde degildi, (2) yanlis parlak bolge "
+                    "tespit edildi. Homografiyi DLP yuzeyinin TAM UZERINDE yeniden "
+                    "olusturun (./Homography).");
+            }
+        }
+
+        if(g_verboseLog)
+        {
+            std::cout << "Width (mm) : "  << measurement.widthMM  << std::endl;
+            std::cout << "Height (mm) : " << measurement.heightMM << std::endl;
+            std::cout << "Center (mm) : (" << measurement.centerMM.x << ", "
+                       << measurement.centerMM.y << ")" << std::endl;
+            std::cout << "Diagonal (mm) : " << measurement.diagonalMM << std::endl;
+            std::cout << "Perspective error (%) : " << measurement.perspectiveErrorPct << std::endl;
+            std::cout << "Rotation (deg) : " << measurement.rotationDeg << std::endl;
+        }
     }
     else
     {
         std::cout << "[UYARI] Homografi yuklenmedi, mm degerleri hesaplanamadi." << std::endl;
     }
 
-    std::cout << "Angle : " << angle << std::endl;
-
-    //------------------------------------------
-    // Pitch / Roll (solvePnP)
-    //------------------------------------------
+    if(g_verboseLog)
+        std::cout << "Angle (minAreaRect) : " << angle << std::endl;
 
     if(calibrationLoaded)
     {
         double pitchDeg = 0.0;
         double rollDeg  = 0.0;
 
+        // FIX (KRITIK BUG - pitch=50 derece gibi anlamsiz sonuclarin asil
+        // nedeni buydu): solvePnP'ye "gercek dunya" nesne boyutu olarak
+        // ONCEDEN olculmus (ve homografi/duzlem hatasi yuzunden yanlis
+        // olabilecek) mm degeri veriliyordu. Oysa sistemin butun onculu su:
+        // operator HANGI DLP modelini hizaladigini zaten SECIYOR (bkz.
+        // selectDLPModel()) - yani nesnenin gercek fiziksel boyutu ONCEDEN
+        // BILINEN bir sabittir (selectedModel.widthMM/heightMM), olculerek
+        // BULUNMASI gereken bir sey degildir. Yanlis olculmus bir boyutu
+        // solvePnP'ye "gercek boyut" diye vermek, kendi kendini besleyen bir
+        // hataya yol aciyordu: hatali mm olcumu -> hatali pose varsayimi ->
+        // solvePnP, yanlis en-boy oranini 2B koseler ile uydurmaya calisirken
+        // KAMERAYA GORE ASIRI EGIK (ör. 50 derece pitch) bir cozume kayiyordu.
+        // Artik pose HER ZAMAN secilen modelin NOMINAL (bilinen dogru) boyutu
+        // ile hesaplaniyor; homografiden gelen mm olcumu ise sadece
+        // Width/Height/Diagonal raporlamasi ve hizalama (X/Y/mesafe) icin
+        // kullaniliyor - iki farkli amac birbirine karistirilmiyor.
+        float poseWidth  = selectedModel.widthMM;
+        float poseHeight = selectedModel.heightMM;
+
         bool poseOk = estimatePose(
             imageCorners,
-            selectedModel.widthMM,
-            selectedModel.heightMM,
+            poseWidth,
+            poseHeight,
             cameraMatrix,
             distCoeffs,
             pitchDeg,
@@ -306,8 +738,15 @@ void measureObject(
 
         if(poseOk)
         {
-            std::cout << "Pitch : " << pitchDeg << " derece" << std::endl;
-            std::cout << "Roll  : " << rollDeg  << " derece" << std::endl;
+            measurement.pitch     = pitchDeg;
+            measurement.roll      = rollDeg;
+            measurement.poseValid = true;
+
+            if(g_verboseLog)
+            {
+                std::cout << "Pitch : " << pitchDeg << " derece" << std::endl;
+                std::cout << "Roll  : " << rollDeg  << " derece" << std::endl;
+            }
         }
         else
         {
@@ -318,6 +757,327 @@ void measureObject(
     {
         std::cout << "[UYARI] Kalibrasyon yok, pitch/roll hesaplanamiyor." << std::endl;
     }
+
+    return measurement;
+}
+
+//--------------------------------------------------
+// Update Alignment Status
+//--------------------------------------------------
+
+AlignmentStatus updateAlignmentStatus(
+    const MeasurementData& measurement,
+    const DLPModel& selectedModel)
+{
+    if(!measurement.valid || !measurement.mmValid || !measurement.poseValid)
+        return AlignmentStatus::NO_DATA;
+
+    // FIX: supheli boyut olcumuyle operatoru yanlis yonlendirmemek icin
+    // ayri, acik bir durum donduruluyor (bkz. measureObject icindeki
+    // sizeSuspicious kontrolu).
+    if(measurement.sizeSuspicious)
+        return AlignmentStatus::SIZE_MISMATCH;
+
+    // FIX (KRITIK REGRESYON): Buradaki hedef merkez YANLISLIKLA A4_WIDTH/2,
+    // A4_HEIGHT/2 (105mm, 148.5mm - A4 kagidinin kendi merkezi) olarak
+    // hesaplaniyordu. Ama ekranda cizilen yesil hedef kutusu (bkz.
+    // computeTargetOverlayPixels) VE formatAlignmentDetail() fonksiyonu
+    // HER IKISI DE secilen DLP modelinin kendi boyutunu (selectedModel.widthMM/2,
+    // selectedModel.heightMM/2) merkez olarak kullaniyor. Bu tutarsizlik yuzunden
+    // MOVE_LEFT/RIGHT/UP/DOWN karari, ekranda gorunen hedef kutusuyla VE panelde
+    // yazan "X Offset"/"Y Offset" degeriyle UYUSMUYORDU - operator "sola git"
+    // yazisini gorup saga giden bir kutuya bakabiliyordu. Dunya (mm) origini
+    // (A4 kagidinin sol-ust kosesi) ile DLP hedef alaninin merkezi FARKLI
+    // kavramlardir - hizalama HER ZAMAN secilen modele gore yapilmali.
+    double targetCenterX = selectedModel.widthMM  / 2.0;
+    double targetCenterY = selectedModel.heightMM / 2.0;
+
+    if(measurement.centerMM.x < targetCenterX - CENTER_TOLERANCE_MM)
+    {
+        return AlignmentStatus::MOVE_RIGHT;
+    }
+    else if(measurement.centerMM.x > targetCenterX + CENTER_TOLERANCE_MM)
+    {
+        return AlignmentStatus::MOVE_LEFT;
+    }
+    else if(measurement.centerMM.y < targetCenterY - CENTER_TOLERANCE_MM)
+    {
+        return AlignmentStatus::MOVE_DOWN;
+    }
+    else if(measurement.centerMM.y > targetCenterY + CENTER_TOLERANCE_MM)
+    {
+        return AlignmentStatus::MOVE_UP;
+    }
+
+    double nominalAvg  = (selectedModel.widthMM + selectedModel.heightMM) / 2.0;
+    double measuredAvg = (measurement.widthMM   + measurement.heightMM)   / 2.0;
+    double sizeDiffPct = (nominalAvg > 1e-6)
+        ? ((measuredAvg - nominalAvg) / nominalAvg) * 100.0
+        : 0.0;
+
+    if(sizeDiffPct < -SIZE_TOLERANCE_PCT)
+    {
+        return AlignmentStatus::MOVE_FORWARD;
+    }
+    else if(sizeDiffPct > SIZE_TOLERANCE_PCT)
+    {
+        return AlignmentStatus::MOVE_BACKWARD;
+    }
+    else if(measurement.roll > ANGLE_TOLERANCE_DEG)
+    {
+        return AlignmentStatus::ROTATE_CCW;
+    }
+    else if(measurement.roll < -ANGLE_TOLERANCE_DEG)
+    {
+        return AlignmentStatus::ROTATE_CW;
+    }
+
+    return AlignmentStatus::OK;
+}
+
+//--------------------------------------------------
+// Alignment Detail Text
+//--------------------------------------------------
+
+std::string formatAlignmentDetail(
+    AlignmentStatus status,
+    const MeasurementData& measurement,
+    const DLPModel& selectedModel)
+{
+    char buf[128];
+
+    double targetCenterX = selectedModel.widthMM  / 2.0;
+    double targetCenterY = selectedModel.heightMM / 2.0;
+
+    double dx = measurement.centerMM.x - targetCenterX;
+    double dy = measurement.centerMM.y - targetCenterY;
+
+    double nominalAvg  = (selectedModel.widthMM + selectedModel.heightMM) / 2.0;
+    double measuredAvg = (measurement.widthMM   + measurement.heightMM)   / 2.0;
+    double sizeDiffPct = (nominalAvg > 1e-6)
+        ? ((measuredAvg - nominalAvg) / nominalAvg) * 100.0
+        : 0.0;
+
+    switch(status)
+    {
+    case AlignmentStatus::MOVE_LEFT:
+    case AlignmentStatus::MOVE_RIGHT:
+        snprintf(buf, sizeof(buf), "X Offset : %+.1f mm", dx);
+        return std::string(buf);
+
+    case AlignmentStatus::MOVE_UP:
+    case AlignmentStatus::MOVE_DOWN:
+        snprintf(buf, sizeof(buf), "Y Offset : %+.1f mm", dy);
+        return std::string(buf);
+
+    case AlignmentStatus::MOVE_FORWARD:
+    case AlignmentStatus::MOVE_BACKWARD:
+        snprintf(buf, sizeof(buf), "Distance Offset : %+.1f %%", sizeDiffPct);
+        return std::string(buf);
+
+    case AlignmentStatus::ROTATE_CW:
+    case AlignmentStatus::ROTATE_CCW:
+        snprintf(buf, sizeof(buf), "Angle Offset : %+.1f deg", measurement.roll);
+        return std::string(buf);
+
+    case AlignmentStatus::SIZE_MISMATCH:
+        snprintf(buf, sizeof(buf), "Beklenen: %.1fx%.1f mm, Olculen: %.1fx%.1f mm",
+                 selectedModel.widthMM, selectedModel.heightMM,
+                 measurement.widthMM, measurement.heightMM);
+        return std::string(buf);
+
+    case AlignmentStatus::OK:
+        return "Tum eksenler tolerans icinde";
+
+    default:
+        return "";
+    }
+}
+
+//--------------------------------------------------
+// Measurement History
+//--------------------------------------------------
+
+class MeasurementHistory
+{
+public:
+    explicit MeasurementHistory(size_t maxSize = 7, size_t minSamples = 3)
+        : m_maxSize(maxSize), m_minSamples(minSamples) {}
+
+    void push(const MeasurementData& m)
+    {
+        if(!m.valid)
+        {
+            m_buffer.clear();
+            return;
+        }
+
+        m_buffer.push_back(m);
+
+        if(m_buffer.size() > m_maxSize)
+            m_buffer.pop_front();
+    }
+
+    bool ready() const
+    {
+        return m_buffer.size() >= m_minSamples;
+    }
+
+    bool empty() const
+    {
+        return m_buffer.empty();
+    }
+
+    MeasurementData median() const
+    {
+        MeasurementData result = m_buffer.back();
+
+        result.widthMM  = medianOf([](const MeasurementData& m){ return m.widthMM;  });
+        result.heightMM = medianOf([](const MeasurementData& m){ return m.heightMM; });
+        result.pitch    = medianOf([](const MeasurementData& m){ return m.pitch;    });
+        result.roll     = medianOf([](const MeasurementData& m){ return m.roll;     });
+        result.diagonalMM          = medianOf([](const MeasurementData& m){ return m.diagonalMM; });
+        result.perspectiveErrorPct = medianOf([](const MeasurementData& m){ return m.perspectiveErrorPct; });
+        result.rotationDeg         = medianOf([](const MeasurementData& m){ return m.rotationDeg; });
+
+        double cx = medianOf([](const MeasurementData& m){ return m.centerMM.x; });
+        double cy = medianOf([](const MeasurementData& m){ return m.centerMM.y; });
+        result.centerMM = cv::Point2d(cx, cy);
+
+        // FIX: median alinirken sizeSuspicious bilgisi kaybolmasin -
+        // bufferdaki son (en guncel) ornegin bayragini tasi.
+        result.sizeSuspicious = m_buffer.back().sizeSuspicious;
+
+        return result;
+    }
+
+private:
+    template <typename Fn>
+    double medianOf(Fn getField) const
+    {
+        std::vector<double> values;
+        values.reserve(m_buffer.size());
+
+        for(const auto& m : m_buffer)
+            values.push_back(getField(m));
+
+        std::sort(values.begin(), values.end());
+
+        size_t n = values.size();
+        return (n % 2 == 1)
+            ? values[n / 2]
+            : (values[n / 2 - 1] + values[n / 2]) / 2.0;
+    }
+
+    std::deque<MeasurementData> m_buffer;
+    size_t m_maxSize;
+    size_t m_minSamples;
+};
+
+//--------------------------------------------------
+// Olcum Kayit Altyapisi
+//--------------------------------------------------
+
+struct LogEntry
+{
+    std::string timestamp;
+    double widthMM;
+    double heightMM;
+    double centerX;
+    double centerY;
+    double pitch;
+    double roll;
+    double rotationDeg;
+    double diagonalMM;
+    double perspectiveErrorPct;
+    std::string status;
+};
+
+LogEntry makeLogEntry(const MeasurementData& m, const std::string& statusText)
+{
+    LogEntry entry;
+
+    entry.timestamp           = nowTimestamp("%Y-%m-%d %H:%M:%S");
+    entry.widthMM             = m.widthMM;
+    entry.heightMM            = m.heightMM;
+    entry.centerX             = m.centerMM.x;
+    entry.centerY             = m.centerMM.y;
+    entry.pitch                = m.pitch;
+    entry.roll                 = m.roll;
+    entry.rotationDeg          = m.rotationDeg;
+    entry.diagonalMM           = m.diagonalMM;
+    entry.perspectiveErrorPct  = m.perspectiveErrorPct;
+    entry.status                = statusText;
+
+    return entry;
+}
+
+bool exportLogToCSV(const std::vector<LogEntry>& entries, const std::string& filename)
+{
+    std::ofstream file(filename);
+
+    if(!file.is_open())
+        return false;
+
+    file << "Timestamp,Width_mm,Height_mm,Center_X_mm,Center_Y_mm,"
+            "Pitch_deg,Roll_deg,Rotation_deg,Diagonal_mm,Perspective_Error_pct,Status\n";
+
+    for(const auto& e : entries)
+    {
+        file << e.timestamp << ","
+             << e.widthMM << ","
+             << e.heightMM << ","
+             << e.centerX << ","
+             << e.centerY << ","
+             << e.pitch << ","
+             << e.roll << ","
+             << e.rotationDeg << ","
+             << e.diagonalMM << ","
+             << e.perspectiveErrorPct << ","
+             << e.status << "\n";
+    }
+
+    file.close();
+    return true;
+}
+
+//--------------------------------------------------
+// Compute Target Overlay
+//--------------------------------------------------
+
+bool computeTargetOverlayPixels(
+    const DLPModel& model,
+    const cv::Mat& invHomography,
+    bool homographyLoaded,
+    std::vector<cv::Point2f>& outCornersPx,
+    cv::Point2f& outCenterPx)
+{
+    if(!homographyLoaded || invHomography.empty())
+        return false;
+
+    std::vector<cv::Point2f> worldCorners = {
+        cv::Point2f(0.0f, 0.0f),
+        cv::Point2f(model.widthMM, 0.0f),
+        cv::Point2f(model.widthMM, model.heightMM),
+        cv::Point2f(0.0f, model.heightMM)
+    };
+
+    cv::perspectiveTransform(worldCorners, outCornersPx, invHomography);
+
+    if(outCornersPx.size() != 4)
+        return false;
+
+    std::vector<cv::Point2f> worldCenter = {
+        cv::Point2f(model.widthMM / 2.0f, model.heightMM / 2.0f)
+    };
+    std::vector<cv::Point2f> centerPx;
+    cv::perspectiveTransform(worldCenter, centerPx, invHomography);
+
+    if(centerPx.empty())
+        return false;
+
+    outCenterPx = centerPx[0];
+    return true;
 }
 
 //--------------------------------------------------
@@ -327,9 +1087,230 @@ void measureObject(
 cv::Mat drawResult(
     const cv::Mat& image,
     const std::vector<std::vector<cv::Point>>& contours,
-    int maxIndex)
+    int maxIndex,
+    const DLPModel& selectedModel,
+    const MeasurementData& measurement,
+    AlignmentStatus status,
+    const cv::Mat& invHomography,
+    bool homographyLoaded,
+    bool cameraConnected,
+    bool calibrationLoaded)
 {
-    cv::Mat result = image.clone();
+    int panelWidth = 340;
+
+    cv::Mat result(
+        image.rows,
+        image.cols + panelWidth,
+        CV_8UC3,
+        cv::Scalar(35,35,35));
+
+    image.copyTo(
+        result(
+            cv::Rect(
+                0,
+                0,
+                image.cols,
+                image.rows)));
+
+    std::vector<cv::Point2f> targetCornersPx;
+    cv::Point2f targetCenterPxF;
+    bool targetOverlayValid = computeTargetOverlayPixels(
+        selectedModel, invHomography, homographyLoaded, targetCornersPx, targetCenterPxF);
+
+    cv::Point targetCenter;
+
+    if(targetOverlayValid)
+    {
+        for(int i = 0; i < 4; i++)
+        {
+            cv::line(
+                result,
+                targetCornersPx[i],
+                targetCornersPx[(i + 1) % 4],
+                cv::Scalar(0,255,0),
+                2);
+        }
+
+        targetCenter = cv::Point(
+            static_cast<int>(std::round(targetCenterPxF.x)),
+            static_cast<int>(std::round(targetCenterPxF.y)));
+    }
+    else
+    {
+        int targetWidth = 400;
+        int targetHeight = 225;
+
+        cv::Rect placeholderRect(
+            image.cols / 2 - targetWidth / 2,
+            image.rows / 2 - targetHeight / 2,
+            targetWidth,
+            targetHeight);
+
+        cv::rectangle(result, placeholderRect, cv::Scalar(0,140,255), 2);
+
+        cv::putText(
+            result,
+            "OLCEK DISI (homografi yok)",
+            cv::Point(placeholderRect.x, placeholderRect.y - 10),
+            cv::FONT_HERSHEY_SIMPLEX,
+            0.5,
+            cv::Scalar(0,140,255),
+            1);
+
+        targetCenter = cv::Point(
+            placeholderRect.x + placeholderRect.width / 2,
+            placeholderRect.y + placeholderRect.height / 2);
+    }
+
+    int panelX = image.cols + 20;
+
+    cv::putText(
+        result,
+        "DLP MEASUREMENT",
+        cv::Point(panelX,32),
+        cv::FONT_HERSHEY_SIMPLEX,
+        0.8,
+        cv::Scalar(255,255,255),
+        2);
+
+    cv::line(
+        result,
+        cv::Point(image.cols,0),
+        cv::Point(image.cols,image.rows),
+        cv::Scalar(255,255,255),
+        2);
+
+    auto drawChecklistLine = [&](int y, const std::string& label, bool ok)
+    {
+        std::string text = (ok ? std::string("[OK] ") : std::string("[--] ")) + label;
+        cv::Scalar color = ok ? cv::Scalar(0,220,0) : cv::Scalar(0,0,255);
+
+        cv::putText(
+            result,
+            text,
+            cv::Point(panelX, y),
+            cv::FONT_HERSHEY_SIMPLEX,
+            0.5,
+            color,
+            2);
+    };
+
+    drawChecklistLine(58,  "Camera Connected",    cameraConnected);
+    drawChecklistLine(80,  "Calibration Loaded",  calibrationLoaded);
+    drawChecklistLine(102, "Homography Loaded",   homographyLoaded);
+    drawChecklistLine(124, "Projection Detected", measurement.valid);
+
+    cv::line(
+        result,
+        cv::Point(panelX, 138),
+        cv::Point(image.cols + panelWidth - 20, 138),
+        cv::Scalar(90,90,90),
+        1);
+
+    cv::putText(
+        result,
+        "Selected Model",
+        cv::Point(panelX,168),
+        cv::FONT_HERSHEY_SIMPLEX,
+        0.65,
+        cv::Scalar(255,255,0),
+        2);
+
+    cv::putText(
+        result,
+        selectedModel.name,
+        cv::Point(panelX,196),
+        cv::FONT_HERSHEY_SIMPLEX,
+        0.65,
+        cv::Scalar(255,255,255),
+        2);
+
+    cv::putText(
+        result,
+        "Measurements",
+        cv::Point(panelX,232),
+        cv::FONT_HERSHEY_SIMPLEX,
+        0.7,
+        cv::Scalar(0,255,255),
+        2);
+
+    char buf[128];
+
+    std::string widthStr = measurement.mmValid
+        ? (snprintf(buf, sizeof(buf), "Width  : %.2f mm", measurement.widthMM), std::string(buf))
+        : "Width  : N/A";
+
+    std::string heightStr = measurement.mmValid
+        ? (snprintf(buf, sizeof(buf), "Height : %.2f mm", measurement.heightMM), std::string(buf))
+        : "Height : N/A";
+
+    std::string centerStr = measurement.mmValid
+        ? (snprintf(buf, sizeof(buf), "Center : (%.1f, %.1f)", measurement.centerMM.x, measurement.centerMM.y), std::string(buf))
+        : "Center : N/A";
+
+    std::string pitchStr = measurement.poseValid
+        ? (snprintf(buf, sizeof(buf), "Pitch  : %.2f deg", measurement.pitch), std::string(buf))
+        : "Pitch  : N/A";
+
+    std::string rollStr = measurement.poseValid
+        ? (snprintf(buf, sizeof(buf), "Roll   : %.2f deg", measurement.roll), std::string(buf))
+        : "Roll   : N/A";
+
+    std::string rotationStr = measurement.valid
+        ? (snprintf(buf, sizeof(buf), "Rotation : %.2f deg", measurement.rotationDeg), std::string(buf))
+        : "Rotation : N/A";
+
+    std::string diagonalStr = measurement.mmValid
+        ? (snprintf(buf, sizeof(buf), "Diagonal : %.2f mm", measurement.diagonalMM), std::string(buf))
+        : "Diagonal : N/A";
+
+    std::string perspectiveStr = measurement.mmValid
+        ? (snprintf(buf, sizeof(buf), "Perspektif : %.2f %%", measurement.perspectiveErrorPct), std::string(buf))
+        : "Perspektif : N/A";
+
+    cv::putText(result, widthStr,      cv::Point(panelX,264), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255,255,255), 2);
+    cv::putText(result, heightStr,     cv::Point(panelX,291), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255,255,255), 2);
+    cv::putText(result, centerStr,     cv::Point(panelX,318), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255,255,255), 2);
+    cv::putText(result, pitchStr,      cv::Point(panelX,345), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255,255,255), 2);
+    cv::putText(result, rollStr,       cv::Point(panelX,372), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255,255,255), 2);
+    cv::putText(result, rotationStr,   cv::Point(panelX,399), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255,255,255), 2);
+    cv::putText(result, diagonalStr,   cv::Point(panelX,426), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255,255,255), 2);
+    cv::putText(result, perspectiveStr,cv::Point(panelX,453), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(255,255,255), 2);
+
+    cv::putText(
+        result,
+        "Status :",
+        cv::Point(panelX,489),
+        cv::FONT_HERSHEY_SIMPLEX,
+        0.7,
+        cv::Scalar(0,255,255),
+        2);
+
+    std::string statusText  = alignmentStatusToString(status);
+    cv::Scalar  statusColor = alignmentStatusToColor(status);
+
+    cv::putText(
+        result,
+        statusText,
+        cv::Point(panelX,522),
+        cv::FONT_HERSHEY_SIMPLEX,
+        0.7,
+        statusColor,
+        2);
+
+    std::string detailText = formatAlignmentDetail(status, measurement, selectedModel);
+
+    if(!detailText.empty())
+    {
+        cv::putText(
+            result,
+            detailText,
+            cv::Point(panelX,550),
+            cv::FONT_HERSHEY_SIMPLEX,
+            0.55,
+            cv::Scalar(200,200,200),
+            2);
+    }
 
     if(maxIndex == -1)
         return result;
@@ -348,8 +1329,15 @@ cv::Mat drawResult(
         cv::line(result, vertices[i], vertices[(i+1)%4], cv::Scalar(0,255,255), 2);
     }
 
-    cv::Point center(box.x + box.width / 2, box.y + box.height / 2);
+    cv::Point center(
+        static_cast<int>(std::round(rotated.center.x)),
+        static_cast<int>(std::round(rotated.center.y)));
+
+    cv::circle(result, targetCenter, 5, cv::Scalar(0,255,0), -1);
+
     cv::circle(result, center, 6, cv::Scalar(0,0,255), -1);
+
+    cv::line(result, center, targetCenter, cv::Scalar(255,0,255), 2);
 
     return result;
 }
@@ -375,6 +1363,12 @@ bool loadCalibration(
     fs["distortion_coefficients"] >> distCoeffs;
     fs.release();
 
+    if(cameraMatrix.empty() || distCoeffs.empty())
+    {
+        std::cout << "Calibration dosyasi bozuk veya eksik!" << std::endl;
+        return false;
+    }
+
     std::cout << "Calibration yuklendi." << std::endl;
     return true;
 }
@@ -397,6 +1391,12 @@ bool loadHomography(
 
     fs["homography_matrix"] >> homographyMatrix;
     fs.release();
+
+    if(homographyMatrix.empty() || homographyMatrix.rows != 3 || homographyMatrix.cols != 3)
+    {
+        std::cout << "Homography dosyasi bozuk veya eksik!" << std::endl;
+        return false;
+    }
 
     std::cout << "Homography yuklendi." << std::endl;
     return true;
@@ -453,14 +1453,86 @@ int main()
                   << "Once ./Homography programini calistirin." << std::endl;
     }
 
+    cv::Mat invHomographyMatrix;
+
+    if(homographyLoaded && !homographyMatrix.empty())
+    {
+        bool inverted = cv::invert(homographyMatrix, invHomographyMatrix);
+
+        if(!inverted)
+        {
+            std::cout << "[UYARI] Homografi tersinir degil, target rectangle cizilemeyecek." << std::endl;
+            homographyLoaded = false;
+        }
+    }
+
     DLPModel selectedModel = selectDLPModel();
 
+    TestPatternType selectedPattern = selectTestPattern();
+
+    if(selectedPattern != TestPatternType::WHITE_RECTANGLE)
+    {
+        std::cout << "[UYARI] Secilen test deseni icin tespit algoritmasi henuz "
+                  << "uygulanmadi. WHITE_RECTANGLE (tam beyaz dikdortgen) "
+                  << "tespiti kullanilacak." << std::endl;
+        selectedPattern = TestPatternType::WHITE_RECTANGLE;
+    }
+
     std::cout << "\nSecilen model: " << selectedModel.name << std::endl;
-    std::cout << "Baslatiliyor...\n" << std::endl;
+    std::cout << "Baslatiliyor... ('v': detayli log, 's': screenshot, "
+              << "'e': CSV export, ESC: cikis)\n" << std::endl;
+
+    if(homographyLoaded)
+    {
+        cv::Mat probeFrame = captureFrame(cap);
+
+        if(!probeFrame.empty())
+        {
+            DLPModel largestModel = g_dlpModels.back();
+
+            std::vector<cv::Point2f> probeCorners;
+            cv::Point2f probeCenter;
+
+            bool ok = computeTargetOverlayPixels(
+                largestModel, invHomographyMatrix, homographyLoaded, probeCorners, probeCenter);
+
+            if(ok)
+            {
+                bool allInside = true;
+
+                for(const auto& pt : probeCorners)
+                {
+                    if(pt.x < 0 || pt.y < 0 ||
+                       pt.x > probeFrame.cols || pt.y > probeFrame.rows)
+                    {
+                        allInside = false;
+                        break;
+                    }
+                }
+
+                if(!allInside)
+                {
+                    std::cout << "\n[UYARI] KAMERA KONUM KONTROLU: En buyuk desteklenen DLP modeli "
+                              << "(" << largestModel.name << ") kamera goruntu cercevesine sigmiyor.\n"
+                              << "        Kamera yanlis konumlanmis olabilir - mesafeyi/acisini kontrol edin "
+                              << "ve Homography programini yeniden calistirin.\n" << std::endl;
+                }
+                else
+                {
+                    std::cout << "[BILGI] Kamera konum kontrolu OK: en buyuk model calisma alanina sigiyor." << std::endl;
+                }
+            }
+        }
+    }
 
     cv::namedWindow("Mask (debug)");
     cv::createTrackbar("Threshold", "Mask (debug)", &g_thresholdValue, 255);
     cv::moveWindow("Mask (debug)", 900, 50);
+
+    MeasurementHistory history(/*maxSize=*/7, /*minSamples=*/3);
+
+    std::vector<LogEntry> logBuffer;
+    auto lastLogTime = std::chrono::steady_clock::now() - std::chrono::seconds(5);
 
     while(true)
     {
@@ -469,9 +1541,17 @@ int main()
         if(frame.empty())
             break;
 
-        frame = undistortFrame(frame, cameraMatrix, distCoeffs);
+        bool cameraConnected = true;
 
-        cv::Mat mask = detectBrightRegion(frame);
+        if(calibrationLoaded)
+        {
+            frame = undistortFrame(frame, cameraMatrix, distCoeffs);
+        }
+
+        cv::Mat gray;
+        cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+
+        cv::Mat mask = detectBrightRegion(gray);
         cv::Mat clean = cleanMask(mask);
 
         cv::imshow("Mask (debug)", clean);
@@ -481,9 +1561,10 @@ int main()
 
         int maxIndex = findLargestContour(clean, contours, hierarchy);
 
-        measureObject(
+        MeasurementData rawMeasurement = measureObject(
             contours,
             maxIndex,
+            gray,
             homographyMatrix,
             homographyLoaded,
             cameraMatrix,
@@ -491,17 +1572,111 @@ int main()
             calibrationLoaded,
             selectedModel);
 
-        cv::Mat result = drawResult(frame, contours, maxIndex);
+        // FIX: supheli (nominal boyuttan cok sapan) bir olcum, gecmis
+        // (history) tamponuna GECERLI diye eklenip medyanla "yikanip"
+        // gizlenmesin - boylece operator SIZE_MISMATCH uyarisini gorup
+        // homografiyi/kurulumu kontrol etmeye zorlanir.
+        history.push(rawMeasurement);
+
+        MeasurementData displayMeasurement;
+        AlignmentStatus status;
+
+        if(!rawMeasurement.valid || history.empty())
+        {
+            displayMeasurement = rawMeasurement;
+            status = AlignmentStatus::NO_DATA;
+        }
+        else if(!history.ready())
+        {
+            displayMeasurement = rawMeasurement;
+            status = AlignmentStatus::STABILIZING;
+        }
+        else
+        {
+            displayMeasurement = history.median();
+            status = updateAlignmentStatus(displayMeasurement, selectedModel);
+        }
+
+        g_status = status;
+
+        if(status != AlignmentStatus::NO_DATA && status != AlignmentStatus::STABILIZING &&
+           status != AlignmentStatus::SIZE_MISMATCH &&
+           displayMeasurement.valid && displayMeasurement.mmValid && displayMeasurement.poseValid)
+        {
+            auto now = std::chrono::steady_clock::now();
+
+            if(std::chrono::duration_cast<std::chrono::milliseconds>(now - lastLogTime).count() >= 1000)
+            {
+                logBuffer.push_back(makeLogEntry(displayMeasurement, alignmentStatusToString(status)));
+                lastLogTime = now;
+            }
+        }
+
+        cv::Mat result =
+            drawResult(
+                frame,
+                contours,
+                maxIndex,
+                selectedModel,
+                displayMeasurement,
+                status,
+                invHomographyMatrix,
+                homographyLoaded,
+                cameraConnected,
+                calibrationLoaded);
 
         cv::imshow("Machine Vision", result);
 
-        if(cv::waitKey(30) == 27)
+        int key = cv::waitKey(30);
+
+        if(key == 27)
+        {
             break;
+        }
+        else if(key == 'v' || key == 'V')
+        {
+            g_verboseLog = !g_verboseLog;
+            std::cout << "[BILGI] Detayli log " << (g_verboseLog ? "ACIK" : "KAPALI") << std::endl;
+        }
+        else if(key == 's' || key == 'S')
+        {
+            std::string filename = "Result_" + nowTimestamp("%Y%m%d_%H%M%S") + ".png";
+
+            if(cv::imwrite(filename, result))
+                std::cout << "[BILGI] Ekran goruntusu kaydedildi: " << filename << std::endl;
+            else
+                std::cout << "[UYARI] Ekran goruntusu kaydedilemedi." << std::endl;
+        }
+        else if(key == 'e' || key == 'E')
+        {
+            if(logBuffer.empty())
+            {
+                std::cout << "[BILGI] Kayitli olcum yok, CSV olusturulmadi." << std::endl;
+            }
+            else
+            {
+                std::string filename = "measurements_log_" + nowTimestamp("%Y%m%d_%H%M%S") + ".csv";
+
+                if(exportLogToCSV(logBuffer, filename))
+                    std::cout << "[BILGI] " << logBuffer.size()
+                              << " kayit CSV'ye yazildi: " << filename << std::endl;
+                else
+                    std::cout << "[UYARI] CSV dosyasi olusturulamadi." << std::endl;
+            }
+        }
     }
 
     cap.release();
     cv::destroyAllWindows();
 
+    if(!logBuffer.empty())
+    {
+        std::string filename = "measurements_log_" + nowTimestamp("%Y%m%d_%H%M%S") + "_auto.csv";
+
+        if(exportLogToCSV(logBuffer, filename))
+            std::cout << "\n[BILGI] Cikiste " << logBuffer.size()
+                      << " olcum kaydi otomatik CSV'ye yazildi: " << filename << std::endl;
+    }
+
     return 0;
 }
-
