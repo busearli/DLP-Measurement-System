@@ -1,5 +1,0 @@
-/Users/busearli/Desktop/MachineVision/build/CMakeFiles/MachineVision.dir
-/Users/busearli/Desktop/MachineVision/build/CMakeFiles/Calibration.dir
-/Users/busearli/Desktop/MachineVision/build/CMakeFiles/Homography.dir
-/Users/busearli/Desktop/MachineVision/build/CMakeFiles/edit_cache.dir
-/Users/busearli/Desktop/MachineVision/build/CMakeFiles/rebuild_cache.dir

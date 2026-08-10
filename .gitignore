@@ -1,0 +1,9 @@
+# Build outputs
+build/
+
+# Calibration files
+*.yml
+
+# macOS
+.DS_Store
+
