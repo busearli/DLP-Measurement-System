@@ -7,8 +7,8 @@
 // Reference Size (A4)
 //--------------------------------------------------
 
-const float A4_WIDTH = 210.0f;
-const float A4_HEIGHT = 297.0f;
+const float A4_WIDTH  = 134.4f;
+const float A4_HEIGHT = 75.6f;
 
 //--------------------------------------------------
 // Mouse ile tiklanan noktalar
@@ -88,8 +88,8 @@ cv::Mat computeHomography(const std::vector<cv::Point2f>& imagePoints)
     std::vector<cv::Point2f> worldPoints = {
         cv::Point2f(0.0f, 0.0f),
         cv::Point2f(A4_WIDTH, 0.0f),
-        cv::Point2f(A4_WIDTH, A4_HEIGHT),
-        cv::Point2f(0.0f, A4_HEIGHT)
+cv::Point2f(A4_WIDTH, A4_HEIGHT),
+cv::Point2f(0.0f, A4_HEIGHT)
     };
 
     return cv::findHomography(imagePoints, worldPoints);
@@ -115,12 +115,12 @@ bool validateHomography(
     if(H.empty() || H.rows != 3 || H.cols != 3)
         return false;
 
-    std::vector<cv::Point2f> worldPoints = {
-        cv::Point2f(0.0f, 0.0f),
-        cv::Point2f(A4_WIDTH, 0.0f),
-        cv::Point2f(A4_WIDTH, A4_HEIGHT),
-        cv::Point2f(0.0f, A4_HEIGHT)
-    };
+        std::vector<cv::Point2f> worldPoints = {
+            cv::Point2f(0.0f, 0.0f),
+            cv::Point2f(A4_WIDTH, 0.0f),
+cv::Point2f(A4_WIDTH, A4_HEIGHT),
+cv::Point2f(0.0f, A4_HEIGHT)
+        };
 
     std::vector<cv::Point2f> reprojected;
     cv::perspectiveTransform(imagePoints, reprojected, H);
@@ -238,7 +238,16 @@ int main()
     }
 
     cv::Mat H = computeHomography(g_clickedPoints);
-
+    std::vector<cv::Point2f> world;
+    cv::perspectiveTransform(g_clickedPoints, world, H);
+    
+    std::cout << "\n--- HOMOGRAPHY TEST ---\n";
+    for(int i = 0; i < 4; i++)
+    {
+        std::cout << i << " : "
+                  << world[i].x << " , "
+                  << world[i].y << std::endl;
+    }
     double reprojErrMM = 0.0;
     bool valid = validateHomography(H, g_clickedPoints, reprojErrMM);
 

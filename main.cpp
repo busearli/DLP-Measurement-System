@@ -263,38 +263,212 @@ cv::Mat captureFrame(cv::VideoCapture& cap)
 }
 
 //--------------------------------------------------
-// Detect Bright Region
+// Detect Blue/Color Region (HSV) - Saha testinde eklendi
 //--------------------------------------------------
+// FIX: Onceki oturumda kullaniciya ait deneysel kodda iki hata vardi:
+//   1) cv::inRange(hsv, lowerBlue, upperBlue, mask) cagrisinda lowerBlue/
+//      upperBlue TANIMSIZDI (lower/upper diye tanimlanmisti) - derlenmiyordu.
+//   2) setMouseCallback her karede yeniden kaydediliyordu ve callback,
+//      DONGU ICINDE HER KEZ YENIDEN OLUSAN yerel bir cv::Mat'in adresini
+//      (&hsv) yakaliyordu - tiklama aninda o adres gecersiz/degismis
+//      olabilirdi (sarkan pointer / UB).
+// Asagida: HSV degerleri artik "Mask (debug)" penceresindeki 6 trackbar'dan
+// canli okunuyor (yeniden derleme gerekmeden ayar yapilabiliyor), mouse
+// callback ise TEK SEFER, dongu DISINDA kaydediliyor ve kalici (adresi
+// sabit) bir cv::Mat'e (HsvCalibState::hsvFrame) isaret ediyor.
 
+int g_hMin = 100, g_hMax = 140;
+int g_sMin = 40,  g_sMax = 255;
+int g_vMin = 60,  g_vMax = 255;
+
+enum class DetectionMode
+{
+    BRIGHTNESS_THRESHOLD,   // eski yontem: tam beyaz/parlak dikdortgen
+    HSV_COLOR_RANGE         // yeni yontem: DLP'nin belirli renkteki (orn. mavi) isigi
+};
+
+// FIX (saha testi - cam ustunden asagidan yansitilan DLP): parlaklik esigi
+// yontemi, ortamdaki her parlak/yansiyan yuzeyi (metal govde, vida, cam
+// yansimasi) de "beyaz" sayabiliyordu. DLP isigi belirli bir RENKTE
+// (ekran goruntulerinde mavi) oldugu icin HSV renk araligi ile filtrelemek
+// cok daha secici. Varsayilan artik HSV_COLOR_RANGE.
+DetectionMode g_detectionMode = DetectionMode::HSV_COLOR_RANGE;
+
+cv::Mat detectColorRegion(const cv::Mat& hsv, int hMin, int hMax, int sMin, int sMax, int vMin, int vMax)
+{
+    // FIX (saha testi - kontur ust kenari tirtikli, olcum %5-10 fazla
+    // cikiyor): detectBrightRegion (eski yontem) threshold'dan ONCE
+    // GaussianBlur uyguluyordu, bu fonksiyon eskiden uygulamiyordu - ham
+    // piksellerde HSV sinirinda tek tek pikseller titresip dalgali/tirtikli
+    // bir maske kenari uretiyordu. Ayni blur adimini burada da uygulayarak
+    // (ozellikle S/V kanallarindaki gurultu) kenari yumusatiyoruz.
+    cv::Mat blurred;
+    cv::GaussianBlur(hsv, blurred, cv::Size(5, 5), 0);
+
+    cv::Mat mask;
+    cv::inRange(blurred, cv::Scalar(hMin, sMin, vMin), cv::Scalar(hMax, sMax, vMax), mask);
+    return mask;
+}
+
+// Eski (brightness) yontem - 'm' tusuyla geri gecis icin korunuyor.
 int g_thresholdValue = 150;
 
-cv::Mat detectBrightRegion(const cv::Mat& gray)
+cv::Mat detectBrightRegion(const cv::Mat& gray, int thresholdValue)
 {
     cv::Mat blurred;
     cv::GaussianBlur(gray, blurred, cv::Size(5, 5), 0);
 
     cv::Mat mask;
-    cv::threshold(
-        blurred,
-        mask,
-        g_thresholdValue,
-        255,
-        cv::THRESH_BINARY);
+    cv::threshold(blurred, mask, thresholdValue, 255, cv::THRESH_BINARY);
 
     return mask;
 }
 
 //--------------------------------------------------
-// Clean Mask
+// HSV Kalibrasyon Araci
 //--------------------------------------------------
+// Kullanim (calisirken):
+//   'i'/'I' -> "ICERI (pattern uzerinde)" ornek toplama modunu ac/kapat,
+//              bu moddayken pattern'in UZERINE 5-10 kez tiklayin
+//   'o'/'O' -> "DISARI (arka plan)" ornek toplama modunu ac/kapat,
+//              bu moddayken arka plana/metale 5-10 kez tiklayin
+//   'r'/'R' -> toplanan orneklerden onerilen H/S/V araligini konsola
+//              yazdirir (bu degerleri Mask (debug) penceresindeki
+//              trackbar'lara elle girin), sonra ornekleri temizler
 
+struct HsvCalibState
+{
+    cv::Mat hsvFrame;                 // her karede guncellenir, ADRESI SABIT kalir
+    bool collectingInside = false;
+    bool collectingOutside = false;
+    std::vector<cv::Vec3b> insideSamples;
+    std::vector<cv::Vec3b> outsideSamples;
+};
+
+void hsvCalibMouseCallback(int event, int x, int y, int, void* userdata)
+{
+    if(event != cv::EVENT_LBUTTONDOWN)
+        return;
+
+    HsvCalibState* state = static_cast<HsvCalibState*>(userdata);
+
+    if(state->hsvFrame.empty() ||
+       x < 0 || y < 0 || x >= state->hsvFrame.cols || y >= state->hsvFrame.rows)
+        return;
+
+    cv::Vec3b p = state->hsvFrame.at<cv::Vec3b>(y, x);
+
+    if(state->collectingInside)
+    {
+        state->insideSamples.push_back(p);
+        std::cout << "[ICERI  #" << state->insideSamples.size() << "] "
+                  << "H=" << (int)p[0] << " S=" << (int)p[1] << " V=" << (int)p[2] << std::endl;
+    }
+    else if(state->collectingOutside)
+    {
+        state->outsideSamples.push_back(p);
+        std::cout << "[DISARI #" << state->outsideSamples.size() << "] "
+                  << "H=" << (int)p[0] << " S=" << (int)p[1] << " V=" << (int)p[2] << std::endl;
+    }
+    else
+    {
+        std::cout << "[BILGI] Once 'i' (icerisi) veya 'o' (disarisi) tusuyla "
+                     "ornek toplama modunu acin." << std::endl;
+    }
+}
+
+void printSuggestedHsvRange(const HsvCalibState& state)
+{
+    if(state.insideSamples.empty())
+    {
+        std::cout << "[UYARI] Hic 'ICERI' ornegi toplanmadi, oneri hesaplanamiyor." << std::endl;
+        return;
+    }
+
+    int hMin = 255, hMax = 0, sMin = 255, sMax = 0, vMin = 255, vMax = 0;
+
+    for(const auto& p : state.insideSamples)
+    {
+        hMin = std::min(hMin, (int)p[0]); hMax = std::max(hMax, (int)p[0]);
+        sMin = std::min(sMin, (int)p[1]); sMax = std::max(sMax, (int)p[1]);
+        vMin = std::min(vMin, (int)p[2]); vMax = std::max(vMax, (int)p[2]);
+    }
+
+    const int hMargin = 5;
+    const int svMargin = 25;
+
+    int lowerH = std::max(0,   hMin - hMargin);
+    int upperH = std::min(179, hMax + hMargin);
+    int lowerS = std::max(0,   sMin - svMargin);
+    int upperS = std::min(255, sMax + svMargin);
+    int lowerV = std::max(0,   vMin - svMargin);
+    int upperV = std::min(255, vMax + svMargin);
+
+    std::cout << "\n===== ONERILEN ARALIK (ICERI orneklerinden, " << state.insideSamples.size()
+              << " nokta) =====\n";
+    std::cout << "H: " << lowerH << " - " << upperH << std::endl;
+    std::cout << "S: " << lowerS << " - " << upperS << std::endl;
+    std::cout << "V: " << lowerV << " - " << upperV << std::endl;
+    std::cout << "(Bu degerleri 'Mask (debug)' penceresindeki trackbar'lara girin)" << std::endl;
+
+    if(!state.outsideSamples.empty())
+    {
+        int falsePositives = 0;
+
+        for(const auto& p : state.outsideSamples)
+        {
+            bool inRange =
+                p[0] >= lowerH && p[0] <= upperH &&
+                p[1] >= lowerS && p[1] <= upperS &&
+                p[2] >= lowerV && p[2] <= upperV;
+
+            if(inRange) falsePositives++;
+        }
+
+        std::cout << falsePositives << " / " << state.outsideSamples.size()
+                  << " DISARI ornegi bu aralikla YANLISLIKLA eslesiyor";
+
+        if(falsePositives > 0)
+            std::cout << " -> aralik hala COK GENIS, ICERI orneklerini patternin "
+                         "kenarindan degil ORTASINA yakin noktalardan toplayip "
+                         "tekrar deneyin.";
+
+        std::cout << std::endl;
+    }
+    else
+    {
+        std::cout << "[BILGI] Karsilastirma icin 'o' ile birkac DISARI (arka plan) "
+                     "ornegi de toplarsaniz oneri daha guvenilir olur." << std::endl;
+    }
+
+    std::cout << "=====================================\n" << std::endl;
+}
 cv::Mat cleanMask(const cv::Mat& mask)
 {
-    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(9,9));
-    cv::Mat opened, closed;
+    cv::Mat opened;
+    cv::Mat closed;
 
-    cv::morphologyEx(mask, opened, cv::MORPH_OPEN, kernel);
-    cv::morphologyEx(opened, closed, cv::MORPH_CLOSE, kernel);
+    cv::Mat openKernel =
+        cv::getStructuringElement(
+            cv::MORPH_RECT,
+            cv::Size(5,5));
+
+    cv::Mat closeKernel =
+        cv::getStructuringElement(
+            cv::MORPH_RECT,
+            cv::Size(7,7));
+
+    cv::morphologyEx(
+        mask,
+        opened,
+        cv::MORPH_OPEN,
+        openKernel);
+
+    cv::morphologyEx(
+        opened,
+        closed,
+        cv::MORPH_CLOSE,
+        closeKernel);
 
     return closed;
 }
@@ -331,18 +505,27 @@ int findLargestContour(
 // Order Corners
 //--------------------------------------------------
 
-std::vector<cv::Point2f> orderCorners(const cv::Point2f rawCorners[4])
+std::vector<cv::Point2f> orderCorners(const std::vector<cv::Point2f>& pts)
 {
-    std::vector<cv::Point2f> pts(rawCorners, rawCorners + 4);
+    if(pts.size() != 4)
+        return pts;
+
     std::vector<cv::Point2f> ordered(4);
 
-    auto sumCmp  = [](const cv::Point2f& a, const cv::Point2f& b) { return (a.x + a.y) < (b.x + b.y); };
-    auto diffCmp = [](const cv::Point2f& a, const cv::Point2f& b) { return (a.x - a.y) < (b.x - b.y); };
+    auto sumCmp = [](const cv::Point2f& a, const cv::Point2f& b)
+    {
+        return (a.x + a.y) < (b.x + b.y);
+    };
 
-    ordered[0] = *std::min_element(pts.begin(), pts.end(), sumCmp);
-    ordered[2] = *std::max_element(pts.begin(), pts.end(), sumCmp);
-    ordered[1] = *std::max_element(pts.begin(), pts.end(), diffCmp);
-    ordered[3] = *std::min_element(pts.begin(), pts.end(), diffCmp);
+    auto diffCmp = [](const cv::Point2f& a, const cv::Point2f& b)
+    {
+        return (a.x - a.y) < (b.x - b.y);
+    };
+
+    ordered[0] = *std::min_element(pts.begin(), pts.end(), sumCmp);   // sol üst
+    ordered[2] = *std::max_element(pts.begin(), pts.end(), sumCmp);   // sağ alt
+    ordered[1] = *std::max_element(pts.begin(), pts.end(), diffCmp);  // sağ üst
+    ordered[3] = *std::min_element(pts.begin(), pts.end(), diffCmp);  // sol alt
 
     return ordered;
 }
@@ -384,6 +567,187 @@ std::vector<cv::Point2f> refineCornersSubPixel(
 
     return refined;
 }
+//==================================================
+// Line Intersection
+//==================================================
+
+bool lineIntersection(
+    const cv::Vec4f& line1,
+    const cv::Vec4f& line2,
+    cv::Point2f& outPoint)
+{
+    float vx1 = line1[0];
+    float vy1 = line1[1];
+    float x1  = line1[2];
+    float y1  = line1[3];
+
+    float vx2 = line2[0];
+    float vy2 = line2[1];
+    float x2  = line2[2];
+    float y2  = line2[3];
+
+    float det = vx1 * vy2 - vy1 * vx2;
+
+    if(std::abs(det) < 1e-6f)
+        return false;
+
+    float t =
+        ((x2 - x1) * vy2 -
+         (y2 - y1) * vx2) / det;
+
+    outPoint.x = x1 + t * vx1;
+    outPoint.y = y1 + t * vy1;
+
+    return true;
+}
+//==================================================
+// Fit Line From Points
+//==================================================
+
+bool fitLineFromPoints(
+    const std::vector<cv::Point2f>& points,
+    cv::Vec4f& line)
+{
+    if(points.size() < 2)
+        return false;
+
+    cv::fitLine(
+        points,
+        line,
+        cv::DIST_L2,
+        0,
+        0.01,
+        0.01);
+
+    return true;
+}
+//--------------------------------------------------
+// Split Contour Into 4 Sides (RotatedRect Axis)
+//--------------------------------------------------
+
+void splitContourSides(
+    const std::vector<cv::Point>& contour,
+    const cv::RotatedRect& rect,
+    std::vector<cv::Point2f>& top,
+    std::vector<cv::Point2f>& right,
+    std::vector<cv::Point2f>& bottom,
+    std::vector<cv::Point2f>& left)
+{
+    top.clear();
+    right.clear();
+    bottom.clear();
+    left.clear();
+
+    float angle = rect.angle;
+
+    if(rect.size.width < rect.size.height)
+        angle += 90.0f;
+
+    float theta = angle * CV_PI / 180.0f;
+
+    cv::Point2f ux(std::cos(theta), std::sin(theta));
+    cv::Point2f uy(-std::sin(theta), std::cos(theta));
+
+    cv::Point2f c = rect.center;
+
+    float halfW = rect.size.width  * 0.5f;
+    float halfH = rect.size.height * 0.5f;
+
+    const float margin = 8.0f;
+
+    for(const auto& p : contour)
+    {
+        cv::Point2f v = cv::Point2f(p) - c;
+
+        float x = v.dot(ux);
+        float y = v.dot(uy);
+
+        if(std::abs(y + halfH) < margin)
+            top.push_back(p);
+
+        if(std::abs(y - halfH) < margin)
+            bottom.push_back(p);
+
+        if(std::abs(x + halfW) < margin)
+            left.push_back(p);
+
+        if(std::abs(x - halfW) < margin)
+            right.push_back(p);
+    }
+}
+//==================================================
+// Extract Precise Corners
+//==================================================
+
+bool extractPreciseCorners(
+    const std::vector<cv::Point>& contour,
+    const cv::RotatedRect& rect,
+    std::vector<cv::Point2f>& corners)
+{
+    corners.clear();
+
+    if(contour.size() < 20)
+        return false;
+
+    //--------------------------------------------------
+// Fallback : FitLine
+//--------------------------------------------------
+
+std::vector<cv::Point2f> top;
+std::vector<cv::Point2f> right;
+std::vector<cv::Point2f> bottom;
+std::vector<cv::Point2f> left;
+
+splitContourSides(
+    contour,
+    rect,
+    top,
+    right,
+    bottom,
+    left);
+
+cv::Vec4f topLine;
+cv::Vec4f rightLine;
+cv::Vec4f bottomLine;
+cv::Vec4f leftLine;
+
+if(!fitLineFromPoints(top, topLine))
+    return false;
+
+if(!fitLineFromPoints(right, rightLine))
+    return false;
+
+if(!fitLineFromPoints(bottom, bottomLine))
+    return false;
+
+if(!fitLineFromPoints(left, leftLine))
+    return false;
+
+cv::Point2f p0;
+cv::Point2f p1;
+cv::Point2f p2;
+cv::Point2f p3;
+
+if(!lineIntersection(topLine, leftLine, p0))
+    return false;
+
+if(!lineIntersection(topLine, rightLine, p1))
+    return false;
+
+if(!lineIntersection(bottomLine, rightLine, p2))
+    return false;
+
+if(!lineIntersection(bottomLine, leftLine, p3))
+    return false;
+
+corners = {p0, p1, p2, p3};
+
+corners = orderCorners(corners);
+
+return true;
+}
+
+
 //--------------------------------------------------
 // Is Rectangular Contour
 //--------------------------------------------------
@@ -576,16 +940,15 @@ MeasurementData measureObject(
     measurement.rect  = rotated;
     measurement.valid = true;
 
-    cv::Point2f rawCorners[4];
-    rotated.points(rawCorners);
+    std::vector<cv::Point2f> imageCorners;
 
-    std::vector<cv::Point2f> refinedCorners = refineCornersSubPixel(grayFrame, rawCorners);
-    cv::Point2f refinedArr[4];
-    for(int i = 0; i < 4; i++)
-        refinedArr[i] = refinedCorners[i];
-
-    std::vector<cv::Point2f> imageCorners = orderCorners(refinedArr);
-
+    if(!extractPreciseCorners(
+            contours[maxIndex],
+            rotated,
+            imageCorners))
+    {
+        return measurement;
+    }
     std::vector<cv::Point2f> worldPoints;
 
     cv::Point2f centerPxF = rotated.center;
@@ -1479,8 +1842,11 @@ int main()
     }
 
     std::cout << "\nSecilen model: " << selectedModel.name << std::endl;
-    std::cout << "Baslatiliyor... ('v': detayli log, 's': screenshot, "
-              << "'e': CSV export, ESC: cikis)\n" << std::endl;
+    std::cout << "Baslatiliyor...\n"
+              << "  'v' detayli log   's' screenshot   'e' CSV export   ESC cikis\n"
+              << "  'm' tespit modunu degistir (HSV Renk Araligi / Parlaklik Esigi)\n"
+              << "  'i' ICERI (pattern) HSV ornegi topla   'o' DISARI (arka plan) HSV ornegi topla\n"
+              << "  'r' toplanan orneklerden onerilen HSV araligini yazdir\n" << std::endl;
 
     if(homographyLoaded)
     {
@@ -1526,8 +1892,24 @@ int main()
     }
 
     cv::namedWindow("Mask (debug)");
-    cv::createTrackbar("Threshold", "Mask (debug)", &g_thresholdValue, 255);
+    cv::createTrackbar("Threshold (Brightness)", "Mask (debug)", &g_thresholdValue, 255);
+    cv::createTrackbar("H min", "Mask (debug)", &g_hMin, 104);
+    cv::createTrackbar("H max", "Mask (debug)", &g_hMax, 120);
+    cv::createTrackbar("S min", "Mask (debug)", &g_sMin, 60);
+    cv::createTrackbar("S max", "Mask (debug)", &g_sMax, 169);
+    cv::createTrackbar("V min", "Mask (debug)", &g_vMin, 230);
+    cv::createTrackbar("V max", "Mask (debug)", &g_vMax, 255);
     cv::moveWindow("Mask (debug)", 900, 50);
+
+    // FIX: kalibrasyon icin kullanilan mouse callback TEK SEFER, dongu
+    // DISINDA kaydediliyor; asagidaki calibState.hsvFrame'in adresi
+    // program boyunca SABIT kalir (dongu icinde sadece ICERIGI guncellenir,
+    // yeniden olusturulmaz) - onceki "sarkan pointer" hatasi boylece
+    // kalici olarak cozuldu (bkz. dosya basindaki HSV Kalibrasyon Araci
+    // yorumu).
+    HsvCalibState calibState;
+    cv::namedWindow("Machine Vision");
+    cv::setMouseCallback("Machine Vision", hsvCalibMouseCallback, &calibState);
 
     MeasurementHistory history(/*maxSize=*/7, /*minSamples=*/3);
 
@@ -1551,7 +1933,21 @@ int main()
         cv::Mat gray;
         cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
 
-        cv::Mat mask = detectBrightRegion(gray);
+        cv::Mat mask;
+
+        if(g_detectionMode == DetectionMode::HSV_COLOR_RANGE)
+        {
+            // ONEMLI: calibState.hsvFrame'in ICERIGINI guncelliyoruz, kendisini
+            // yeniden OLUSTURMUYORUZ - boylece mouse callback'in tuttugu adres
+            // her zaman GECERLI ve GUNCEL kalir.
+            cv::cvtColor(frame, calibState.hsvFrame, cv::COLOR_BGR2HSV);
+            mask = detectColorRegion(calibState.hsvFrame, g_hMin, g_hMax, g_sMin, g_sMax, g_vMin, g_vMax);
+        }
+        else
+        {
+            mask = detectBrightRegion(gray, g_thresholdValue);
+        }
+
         cv::Mat clean = cleanMask(mask);
 
         cv::imshow("Mask (debug)", clean);
@@ -1625,6 +2021,13 @@ int main()
                 cameraConnected,
                 calibrationLoaded);
 
+        // Aktif tespit modunu videonun sol-ustune yaz (Adim: saha testi
+        // sirasinda hangi yontemin aktif oldugu her zaman gorunur olsun).
+        std::string modeText = (g_detectionMode == DetectionMode::HSV_COLOR_RANGE)
+            ? "Mode: HSV Renk Araligi (m: degistir, i/o/r: kalibrasyon)"
+            : "Mode: Parlaklik Esigi (m: degistir)";
+        cv::putText(result, modeText, cv::Point(20, 30), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0,255,255), 2);
+
         cv::imshow("Machine Vision", result);
 
         int key = cv::waitKey(30);
@@ -1637,6 +2040,40 @@ int main()
         {
             g_verboseLog = !g_verboseLog;
             std::cout << "[BILGI] Detayli log " << (g_verboseLog ? "ACIK" : "KAPALI") << std::endl;
+        }
+        else if(key == 'm' || key == 'M')
+        {
+            g_detectionMode = (g_detectionMode == DetectionMode::HSV_COLOR_RANGE)
+                ? DetectionMode::BRIGHTNESS_THRESHOLD
+                : DetectionMode::HSV_COLOR_RANGE;
+
+            std::cout << "[BILGI] Tespit modu: "
+                      << (g_detectionMode == DetectionMode::HSV_COLOR_RANGE ? "HSV Renk Araligi" : "Parlaklik Esigi")
+                      << std::endl;
+        }
+        else if(key == 'i' || key == 'I')
+        {
+            calibState.collectingInside = !calibState.collectingInside;
+            calibState.collectingOutside = false;
+            std::cout << "[KALIBRASYON] ICERI ornek toplama "
+                      << (calibState.collectingInside ? "ACIK - patternin ustune tiklayin" : "KAPALI")
+                      << std::endl;
+        }
+        else if(key == 'o' || key == 'O')
+        {
+            calibState.collectingOutside = !calibState.collectingOutside;
+            calibState.collectingInside = false;
+            std::cout << "[KALIBRASYON] DISARI ornek toplama "
+                      << (calibState.collectingOutside ? "ACIK - arka plana/metale tiklayin" : "KAPALI")
+                      << std::endl;
+        }
+        else if(key == 'r' || key == 'R')
+        {
+            printSuggestedHsvRange(calibState);
+            calibState.insideSamples.clear();
+            calibState.outsideSamples.clear();
+            calibState.collectingInside = false;
+            calibState.collectingOutside = false;
         }
         else if(key == 's' || key == 'S')
         {
