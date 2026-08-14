@@ -280,6 +280,26 @@ bool *alignmentLocked =
 const double COMMAND_MOVE_THRESHOLD_MM = 2.0;
 const double COMMAND_ANGLE_THRESHOLD_DEG = 0.5;
 
+//==================================================
+// ADIM ADIM HIZALAMA
+//==================================================
+
+// Verilen komutun hedef degeri.
+// Ornegin MOVE_LEFT komutu verildiginde,
+// hedef X koordinati burada tutulur.
+double *alignmentTargetValue =
+    new double(0.0);
+
+// Hamle tamamlandi mi?
+bool *alignmentStepCompleted =
+    new bool(false);
+
+// Tamamlandi mesajini birkac kare gostermek icin
+int *alignmentCompletedFrames =
+    new int(0);
+
+const int ALIGNMENT_COMPLETED_DISPLAY_FRAMES = 15;
+
 QObject::connect(cameraTimer, &QTimer::timeout, [=]() {
     static int frameCounter = 0;
     std::cout << "[FRAME] " << ++frameCounter << std::endl;
@@ -911,7 +931,8 @@ alignmentStatusToTurkish(
             // Duruma gore renk
             //--------------------------------------------------
 
-            if(alignment == AlignmentStatus::OK)
+            if(alignment == AlignmentStatus::OK ||
+                *alignmentStepCompleted)
             {
                 direction->setStyleSheet(
                     "font-size: 24px;"
