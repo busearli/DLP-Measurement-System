@@ -748,7 +748,18 @@ measurement.rotationDeg =
             double d12 = cv::norm(worldPoints[1] - worldPoints[2]);
             double d23 = cv::norm(worldPoints[2] - worldPoints[3]);
             double d30 = cv::norm(worldPoints[3] - worldPoints[0]);
-
+// Diklik ayari icin dort kenari ayri ayri sakla
+measurement.edge01MM = d01;
+measurement.edge12MM = d12;
+measurement.edge23MM = d23;
+measurement.edge30MM = d30;
+std::cout
+    << "[DIKLIK KENARLARI] "
+    << "01=" << measurement.edge01MM << " mm | "
+    << "12=" << measurement.edge12MM << " mm | "
+    << "23=" << measurement.edge23MM << " mm | "
+    << "30=" << measurement.edge30MM << " mm"
+    << std::endl;
             double sideA = (d01 + d23) / 2.0;
             double sideB = (d12 + d30) / 2.0;
 
@@ -875,17 +886,14 @@ AlignmentStatus updateAlignmentStatus(
     if(measurement.sizeSuspicious)
         return AlignmentStatus::SIZE_MISMATCH;
 
-   // 4 referans vidanin olusturdugu fiziksel alan
-constexpr double SCREW_FRAME_WIDTH_MM  = 222.5;
-constexpr double SCREW_FRAME_HEIGHT_MM = 150.0;
-
-// Gercek hedef: 4 vidanin geometrik merkezi
-const double targetCenterX = SCREW_FRAME_WIDTH_MM  / 2.0; // 111.25 mm
-const double targetCenterY = SCREW_FRAME_HEIGHT_MM / 2.0; // 75.00 mm
-
-// Projeksiyon merkezinin hedef merkezden sapmasi
-const double dx = measurement.centerMM.x - targetCenterX;
-const double dy = measurement.centerMM.y - targetCenterY;
+        constexpr double SCREW_FRAME_WIDTH_MM  = 220.41;
+        constexpr double SCREW_FRAME_HEIGHT_MM = 145.60;
+        
+        const double targetCenterX = SCREW_FRAME_WIDTH_MM  / 2.0; // 110.205
+        const double targetCenterY = SCREW_FRAME_HEIGHT_MM / 2.0; // 72.80
+        
+        const double dx = measurement.centerMM.x - targetCenterX;
+        const double dy = measurement.centerMM.y - targetCenterY;
 
 const bool xOutside = std::abs(dx) > CENTER_TOLERANCE_MM;
 const bool yOutside = std::abs(dy) > CENTER_TOLERANCE_MM;
@@ -896,10 +904,11 @@ if(xOutside || yOutside)
 {
     if(xOutside && (!yOutside || std::abs(dx) >= std::abs(dy)))
     {
-        if(dx > 0.0)
-            return AlignmentStatus::MOVE_LEFT;
-        else
-            return AlignmentStatus::MOVE_RIGHT;
+// Kullanici perspektifine gore sag / sol
+if(dx > 0.0)
+    return AlignmentStatus::MOVE_RIGHT;
+else
+    return AlignmentStatus::MOVE_LEFT;
     }
     else
     {

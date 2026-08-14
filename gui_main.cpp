@@ -9,9 +9,11 @@
 #include <QTimer>
 #include <QImage>
 #include <QPixmap>
+#include <QMouseEvent>
 #include <opencv2/opencv.hpp>
 #include "screw_detector.hpp"
 #include "measurement_engine.hpp"
+#include "clickable_label.hpp"
 
 
 //==================================================
@@ -45,6 +47,45 @@ bool loadCalibrationGUI(
     return true;
 }
 
+//==================================================
+// MANUEL VIDA REFERANSI: ekran (QLabel) koordinatini
+// gercek kamera karesi koordinatina cevir
+//==================================================
+// FIX (manuel vida referansi): cameraView, goruntuyu KeepAspectRatio ile
+// olcekleyip ortaliyor (letterbox). Kullanicinin tikladigi QLabel pikseli
+// ile kameranin gercek kare pikseli farkli - bu fonksiyon olcek ve
+// bosluklari (letterbox) hesaba katarak dogru donusumu yapar.
+
+cv::Point2f mapLabelClickToFrame(const QPoint& clickPos, const QSize& labelSize, const cv::Size& frameSize)
+{
+    if(frameSize.width <= 0 || frameSize.height <= 0 ||
+       labelSize.width() <= 0 || labelSize.height() <= 0)
+    {
+        return cv::Point2f(-1.0f, -1.0f);
+    }
+
+    double scale = std::min(
+        static_cast<double>(labelSize.width())  / frameSize.width,
+        static_cast<double>(labelSize.height()) / frameSize.height
+    );
+
+    double dispW = frameSize.width  * scale;
+    double dispH = frameSize.height * scale;
+
+    double offsetX = (labelSize.width()  - dispW) / 2.0;
+    double offsetY = (labelSize.height() - dispH) / 2.0;
+
+    double fx = (clickPos.x() - offsetX) / scale;
+    double fy = (clickPos.y() - offsetY) / scale;
+
+    if(fx < 0 || fy < 0 || fx >= frameSize.width || fy >= frameSize.height)
+    {
+        return cv::Point2f(-1.0f, -1.0f); // letterbox bosluguna tiklandi
+    }
+
+    return cv::Point2f(static_cast<float>(fx), static_cast<float>(fy));
+}
+
 int main(int argc, char *argv[])
 {
     QApplication app(argc, argv);
@@ -71,7 +112,9 @@ int main(int argc, char *argv[])
     QHBoxLayout *contentLayout = new QHBoxLayout;
 
     // Kamera alani
-    QLabel *cameraView = new QLabel("Kamera goruntusu burada gosterilecek");
+    // FIX (manuel vida referansi): normal QLabel yerine ClickableLabel -
+    // artik uzerine tiklamalari yakalayabiliyoruz.
+    ClickableLabel *cameraView = new ClickableLabel("Kamera goruntusu burada gosterilecek");
     cameraView->setAlignment(Qt::AlignCenter);
     cameraView->setMinimumSize(800, 500);
     cameraView->setStyleSheet(
@@ -175,6 +218,17 @@ cv::Mat *cameraMatrix = new cv::Mat();
 cv::Mat *distCoeffs = new cv::Mat();
 bool *calibrationLoaded = new bool(false);
 
+// FIX (manuel vida referansi): son gelen HAM (undistort/gray donusum
+// oncesi degil, camerayla ayni boyutta) karenin boyutu - tiklama
+// koordinat donusumu icin gerekli.
+cv::Size *lastFrameSize = new cv::Size(0, 0);
+
+// FIX (manuel vida referansi): kullanicinin sirayla tikladigi 4 nokta
+// (kamera KARE koordinatinda, QLabel koordinatinda DEGIL).
+std::vector<cv::Point2f> *manualScrewPoints = new std::vector<cv::Point2f>();
+
+const char* SCREW_CLICK_NAMES[4] = { "TL (sol ust)", "TR (sag ust)", "BR (sag alt)", "BL (sol alt)" };
+
 QObject::connect(startButton, &QPushButton::clicked, [=]() {
 
     // Kamera zaten aciksa tekrar acma
@@ -209,33 +263,136 @@ QObject::connect(startButton, &QPushButton::clicked, [=]() {
     else
         calibrationStatus->setText("✗ Kamera Kalibrasyonu");
 
-    direction->setText("KAMERA AKTIF - VIDA REFERANSI BEKLENIYOR");
+    // FIX (manuel vida referansi): her yeni baslatmada tiklama listesini
+    // sifirla, boylece onceki oturumdan kalan noktalar karismaz.
+    manualScrewPoints->clear();
+
+    direction->setText("KAMERA AKTIF - EKRANDAKI 4 REFERANS VIDAYA SIRAYLA TIKLAYIN (TL, TR, BR, BL)");
+    screwStatus->setText("○ Vida Referansi 0/4");
 
     cameraTimer->start(30);
 });
 
-int *goodScrewFrames = new int(0);
+// (Eski otomatik-tespit degiskenleri asagida hala duruyor - screwReferenceLocked/
+// lockedScrewQuad artik MANUEL tiklamayla dolduruluyor, mantik ayni kaldi ki
+// homografi/olcum tarafina (asagisi) HIC DOKUNMAMIS olalim.)
 
-int *missedScrewFrames = new int(0);
+int *goodScrewFrames = new int(0);          // artik kullanilmiyor (manuel modda), dokunulmadi
+int *missedScrewFrames = new int(0);        // artik kullanilmiyor (manuel modda), dokunulmadi
 
 std::vector<cv::Point2f> *previousScrewQuad =
-    new std::vector<cv::Point2f>();
+    new std::vector<cv::Point2f>();         // artik kullanilmiyor (manuel modda), dokunulmadi
 
 std::vector<cv::Point2f> *accumulatedScrewQuad =
     new std::vector<cv::Point2f>(
         4,
         cv::Point2f(0.0f, 0.0f)
-    );
+    );                                       // artik kullanilmiyor (manuel modda), dokunulmadi
 
 bool *screwReferenceLocked = new bool(false);
 
 std::vector<cv::Point2f> *lockedScrewQuad =
     new std::vector<cv::Point2f>();
 
-// main.cpp ile AYNI degerler
+// main.cpp ile AYNI degerler (otomatik moda donuldugunde kullanilacak)
 const int REQUIRED_SCREW_FRAMES = 8;
 const double MAX_SCREW_JUMP_PX = 15.0;
 const int MAX_MISSED_SCREW_FRAMES = 3;
+
+//--------------------------------------------------
+// FIX (manuel vida referansi): kamera goruntusune tiklandiginda calisir.
+// 4. noktadan sonraki tiklamalar yok sayilir (reset icin sag tik kullanin).
+//--------------------------------------------------
+
+QObject::connect(cameraView, &ClickableLabel::clicked, [=](QPoint pos) {
+
+    if(!cap->isOpened())
+        return;
+
+    if(*screwReferenceLocked)
+    {
+        // Referans zaten kilitlendiyse yeni tiklamalari yok say -
+        // once sag tikla sifirlamak gerekir.
+        return;
+    }
+
+    if(manualScrewPoints->size() >= 4)
+        return;
+
+    cv::Point2f framePt = mapLabelClickToFrame(pos, cameraView->size(), *lastFrameSize);
+
+    if(framePt.x < 0 || framePt.y < 0)
+    {
+        std::cout << "[MANUEL VIDA] Tiklama goruntu disina denk geldi, yok sayildi." << std::endl;
+        return;
+    }
+
+    manualScrewPoints->push_back(framePt);
+
+    std::cout << "[MANUEL VIDA] Nokta " << manualScrewPoints->size() << "/4 ("
+              << SCREW_CLICK_NAMES[manualScrewPoints->size() - 1] << "): ("
+              << framePt.x << ", " << framePt.y << ")" << std::endl;
+
+    screwStatus->setText(
+        QString("○ Vida Referansi %1/4").arg(manualScrewPoints->size())
+    );
+
+    if(manualScrewPoints->size() < 4)
+    {
+        direction->setText(
+            QString("SIMDI TIKLAYIN: %1").arg(SCREW_CLICK_NAMES[manualScrewPoints->size()])
+        );
+    }
+    else
+    {
+        //--------------------------------------------------
+        // 4 nokta tamamlandi - homografiyi HEMEN hesapla.
+        //--------------------------------------------------
+
+        *lockedScrewQuad = *manualScrewPoints;
+
+        std::vector<cv::Point2f> worldPoints = {
+            {0.0f, 0.0f},
+            {222.5f, 0.0f},
+            {222.5f, 150.0f},
+            {0.0f, 150.0f}
+        };
+
+        std::cout << "[MANUEL VIDA] 4 nokta tamamlandi, homografi hesaplaniyor..." << std::endl;
+
+        *screwReferenceLocked = true;
+
+        screwStatus->setText("✓ Vida Referansi");
+        direction->setText("VIDA REFERANSI TAMAMLANDI - HOMOGRAFI HESAPLANIYOR...");
+
+        // NOT: homografi hesaplama ve stage2Active/homographyReady atamasi
+        // asagida (timer lambda'sinin en ustunde) tek seferlik olarak
+        // yapiliyor - orada cv::findHomography sonucu KONTROL EDILEBILIYOR
+        // (bos donerse kullaniciya hata gosterip sifirlayabiliyoruz).
+    }
+});
+
+//--------------------------------------------------
+// FIX (manuel vida referansi): sag tik = referansi sifirla, yeniden
+// tikla. Yanlis bir noktaya tiklandiginda 4'u de yeniden yapmaya
+// gerek kalmadan (veya kilitlendikten sonra yanlis cikarsa) kullanmak icin.
+//--------------------------------------------------
+
+QObject::connect(cameraView, &ClickableLabel::rightClicked, [=](QPoint) {
+
+    if(!cap->isOpened())
+        return;
+
+    manualScrewPoints->clear();
+    lockedScrewQuad->clear();
+    *screwReferenceLocked = false;
+
+    std::cout << "[MANUEL VIDA] Referans sifirlandi, yeniden tiklamaya baslayin." << std::endl;
+
+    screwStatus->setText("○ Vida Referansi 0/4");
+    direction->setText("REFERANS SIFIRLANDI - EKRANDAKI 4 VIDAYA SIRAYLA TIKLAYIN (TL, TR, BR, BL)");
+});
+
 //==================================================
 // ASAMA 2 - HOMOGRAFI / PROJEKSIYON OLCUM DURUMU
 //==================================================
@@ -243,6 +400,54 @@ const int MAX_MISSED_SCREW_FRAMES = 3;
 cv::Mat *homographyMatrix = new cv::Mat();
 bool *homographyReady = new bool(false);
 bool *stage2Active = new bool(false);
+//--------------------------------------------------
+// ASAMA 2 - DIKLIK AYARI
+//--------------------------------------------------
+
+enum class PerpendicularStage
+{
+    TOP_BOTTOM,
+    LEFT_RIGHT,
+    COMPLETED
+};
+
+PerpendicularStage *perpendicularStage =
+    new PerpendicularStage(
+        PerpendicularStage::TOP_BOTTOM
+    );
+
+// Kenarlar kac ard arda kare tolerans icinde?
+int *perpendicularStableFrames =
+    new int(0);
+
+// Tek bir olcume gore asama gecmeyelim.
+const int PERPENDICULAR_REQUIRED_FRAMES = 5;
+
+// Karsilikli kenarlar arasinda izin verilen fark.
+// Ilk test icin 0.50 mm kullaniyoruz.
+const double PERPENDICULAR_TOLERANCE_MM = 0.20;
+// GUI yazilarini daha yavas guncelle
+int *guiUpdateCounter = new int(0);
+
+const int GUI_UPDATE_EVERY_N_FRAMES = 15;
+//--------------------------------------------------
+// DIKLIK ESITLENEN DEGERLERI KILITLE
+//--------------------------------------------------
+
+// Ust-alt esitlendigi anda bulunan ortak deger
+double *lockedTopBottomMM =
+    new double(0.0);
+
+// Sol-sag esitlendigi anda bulunan ortak deger
+double *lockedLeftRightMM =
+    new double(0.0);
+
+// Bu degerler su anda kilitli mi?
+bool *topBottomValueLocked =
+    new bool(false);
+
+bool *leftRightValueLocked =
+    new bool(false);
 MeasurementHistory *measurementHistory =
     new MeasurementHistory(7, 3);
     MeasurementData *lastValidMeasurement =
@@ -299,18 +504,44 @@ int *alignmentCompletedFrames =
     new int(0);
 
 const int ALIGNMENT_COMPLETED_DISPLAY_FRAMES = 15;
+//--------------------------------------------------
+// HIZALAMA BOZULMA KONTROLU
+//--------------------------------------------------
+
+int *alignmentLostFrames =
+    new int(0);
+
+const int ALIGNMENT_LOST_REQUIRED_FRAMES = 5;
+
+//--------------------------------------------------
+// KAMERA TIMER
+//--------------------------------------------------
 
 QObject::connect(cameraTimer, &QTimer::timeout, [=]() {
+
     static int frameCounter = 0;
-    std::cout << "[FRAME] " << ++frameCounter << std::endl;
+
+    std::cout
+        << "[FRAME] "
+        << ++frameCounter
+        << std::endl;
+
     if(!cap->isOpened())
         return;
+//--------------------------------------------------
+// ASAMA 2 - DIKLIK AYARI
+//--------------------------------------------------
+
 
     cv::Mat frame;
     (*cap) >> frame;
 
     if(frame.empty())
         return;
+
+    // FIX (manuel vida referansi): tiklama koordinat donusumu icin
+    // kare boyutunu her zaman guncel tut.
+    *lastFrameSize = frame.size();
 
     //--------------------------------------------------
     // 1) Gri goruntu
@@ -319,288 +550,84 @@ QObject::connect(cameraTimer, &QTimer::timeout, [=]() {
     cv::Mat gray;
     cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
 
-    //--------------------------------------------------
-    // 2) Vida adaylarini bul
-    //--------------------------------------------------
-
     cv::Mat display = frame.clone();
 
-    std::vector<cv::Point2f> candidates =
-        detectScrewCandidates(gray, display);
-
-    std::vector<cv::Point2f> quad;
-
-    bool found =
-        selectBestScrewQuad(candidates, quad);
-
-    bool accepted =
-        found && quad.size() == 4;
-        std::cout
-        << "[GUI VIDA] candidates=" << candidates.size()
-        << " found=" << found
-        << " quad=" << quad.size()
-        << std::endl;
-
     //--------------------------------------------------
-    // 3) Geometri kontrolu
+    // FIX (manuel vida referansi): eski otomatik tespit
+    // (detectScrewCandidates / selectBestScrewQuad / sanityCheckQuad)
+    // BURADAN KALDIRILDI - screw_detector.cpp/hpp icinde hala mevcut,
+    // silinmedi. Otomatik moda donmek icin bu bloğun yerine eski
+    // cagriyi geri koymak yeterli (asagidaki manuel cizim blogunu
+    // kaldirip yerine eski "candidates/selectBestScrewQuad" akisini
+    // eklemeniz yeterli).
     //--------------------------------------------------
 
-    if(accepted)
+    // Zaten tiklanmis (henuz 4'e tamamlanmamis) noktalari ciz.
+    for(size_t i = 0; i < manualScrewPoints->size(); i++)
     {
-        std::string reason;
-
-       if(!sanityCheckQuad(quad, reason))
-{
-    std::cout
-        << "[GUI VIDA] sanityCheck RED: "
-        << reason
-        << std::endl;
-
-    accepted = false;
-}
-else
-{
-    std::cout
-        << "[GUI VIDA] sanityCheck OK"
-        << std::endl;
-}
+        cv::circle(display, (*manualScrewPoints)[i], 8, cv::Scalar(0, 255, 0), -1);
+        cv::putText(display, SCREW_CLICK_NAMES[i],
+                    (*manualScrewPoints)[i] + cv::Point2f(10, -10),
+                    cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 0), 2);
     }
 
     //--------------------------------------------------
-    // 4) Onceki kareye gore ani sicrama kontrolu
+    // Referans daha yeni kilitlendiyse (4. tiklama bu karede degil,
+    // onceki bir click-callback'te oldu) homografiyi TEK SEFER hesapla.
     //--------------------------------------------------
 
-    if(accepted && !previousScrewQuad->empty())
+    if(*screwReferenceLocked && !*homographyReady && lockedScrewQuad->size() == 4)
     {
+        std::vector<cv::Point2f> worldPoints = {
+            {0.0f, 0.0f},
+            {222.5f, 0.0f},
+            {222.5f, 150.0f},
+            {0.0f, 150.0f}
+        };
+
+        *homographyMatrix = cv::findHomography(*lockedScrewQuad, worldPoints);
+
+        if(!homographyMatrix->empty())
+        {
+            *homographyReady = true;
+            *stage2Active = true;
+
+            std::cout << "[MANUEL VIDA] Homografi basariyla olusturuldu." << std::endl;
+            std::cout << "[MANUEL VIDA] ASAMA 2 baslatildi." << std::endl;
+
+            direction->setText("ASAMA 2 - PROJEKSIYON ARANIYOR...");
+        }
+        else
+        {
+            // FIX: 4 nokta neredeyse dogrusal/dejenere ise findHomography
+            // bos donebilir - kullaniciyi bilgilendirip sifirla.
+            std::cerr << "[MANUEL VIDA][HATA] Homografi hesaplanamadi "
+                      << "(4 nokta dogrusal/gecersiz olabilir)." << std::endl;
+
+            direction->setText("HOMOGRAFI HATASI - SAG TIKLA SIFIRLAYIP TEKRAR TIKLAYIN");
+
+            manualScrewPoints->clear();
+            lockedScrewQuad->clear();
+            *screwReferenceLocked = false;
+
+            screwStatus->setText("○ Vida Referansi 0/4");
+        }
+    }
+
+    // Kilitli referansi (yesil dortgen) her karede ciz.
+    if(*screwReferenceLocked && lockedScrewQuad->size() == 4)
+    {
+        const char* shortNames[4] = { "TL", "TR", "BR", "BL" };
+
         for(int i = 0; i < 4; i++)
         {
-            double jump =
-                cv::norm(quad[i] - (*previousScrewQuad)[i]);
-
-            if(jump > MAX_SCREW_JUMP_PX)
-            {
-                accepted = false;
-                break;
-            }
+            cv::circle(display, (*lockedScrewQuad)[i], 8, cv::Scalar(0, 255, 0), -1);
+            cv::putText(display, shortNames[i], (*lockedScrewQuad)[i] + cv::Point2f(10, -10),
+                        cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0, 255, 0), 2);
+            cv::line(display, (*lockedScrewQuad)[i], (*lockedScrewQuad)[(i + 1) % 4],
+                     cv::Scalar(0, 255, 0), 2);
         }
     }
-
-    //--------------------------------------------------
-// 5) Stabil vida referansi - main.cpp ile ayni mantik
-//--------------------------------------------------
-
-if(accepted)
-{
-    // Bu kare basarili
-    *missedScrewFrames = 0;
-
-    // Yeni bir 8-karelik toplama basliyorsa
-    // accumulator'u temizle
-    if(*goodScrewFrames == 0)
-    {
-        for(int i = 0; i < 4; ++i)
-        {
-            (*accumulatedScrewQuad)[i] =
-                cv::Point2f(0.0f, 0.0f);
-        }
-    }
-
-    //--------------------------------------------------
-    // Bu karenin 4 vida noktasini toplama ekle
-    //--------------------------------------------------
-
-    for(int i = 0; i < 4; ++i)
-    {
-        (*accumulatedScrewQuad)[i] += quad[i];
-    }
-
-    *previousScrewQuad = quad;
-
-    if(*goodScrewFrames < REQUIRED_SCREW_FRAMES)
-    {
-        (*goodScrewFrames)++;
-    }
-
-    //--------------------------------------------------
-    // TL / TR / BR / BL ciz
-    //--------------------------------------------------
-
-    const char* names[4] = {
-        "TL", "TR", "BR", "BL"
-    };
-
-    for(int i = 0; i < 4; ++i)
-    {
-        cv::circle(
-            display,
-            quad[i],
-            8,
-            cv::Scalar(0,255,0),
-            -1
-        );
-
-        cv::putText(
-            display,
-            names[i],
-            quad[i] + cv::Point2f(10,-10),
-            cv::FONT_HERSHEY_SIMPLEX,
-            0.7,
-            cv::Scalar(0,255,0),
-            2
-        );
-
-        cv::line(
-            display,
-            quad[i],
-            quad[(i + 1) % 4],
-            cv::Scalar(0,255,0),
-            2
-        );
-    }
-}
-else if(!*screwReferenceLocked)
-{
-    //--------------------------------------------------
-    // main.cpp gibi gecici kotu kareleri tolere et
-    //--------------------------------------------------
-
-    (*missedScrewFrames)++;
-
-    std::cout
-        << "[GUI VIDA] Gecici vida kaybi: "
-        << *missedScrewFrames
-        << "/"
-        << MAX_MISSED_SCREW_FRAMES
-        << std::endl;
-
-    //--------------------------------------------------
-    // Ancak 3'ten fazla arka arkaya kotu kare gelirse
-    // stabiliteyi bastan baslat
-    //--------------------------------------------------
-
-    if(*missedScrewFrames > MAX_MISSED_SCREW_FRAMES)
-    {
-        std::cout
-            << "[GUI VIDA] Vida referansi uzun sure kayip. "
-            << "Stabilite yeniden baslatiliyor."
-            << std::endl;
-
-        *goodScrewFrames = 0;
-        *missedScrewFrames = 0;
-
-        previousScrewQuad->clear();
-
-        for(int i = 0; i < 4; ++i)
-        {
-            (*accumulatedScrewQuad)[i] =
-                cv::Point2f(0.0f, 0.0f);
-        }
-    }
-}
-
-
-    //--------------------------------------------------
-    // 6) GUI durumunu guncelle
-    //--------------------------------------------------
-
-    if(*goodScrewFrames >= REQUIRED_SCREW_FRAMES)
-{
-    if(!*screwReferenceLocked)
-    {
-        //--------------------------------------------------
-// main.cpp ile ayni:
-// 8 basarili karenin ortalama vida konumlarini kullan
-//--------------------------------------------------
-
-lockedScrewQuad->resize(4);
-
-for(int i = 0; i < 4; ++i)
-{
-    (*lockedScrewQuad)[i] =
-        (*accumulatedScrewQuad)[i] /
-        static_cast<float>(REQUIRED_SCREW_FRAMES);
-}
-
-// Ortalama referans artik kesin olarak kilitlendi
-*screwReferenceLocked = true;
-
-std::cout
-    << "[GUI] Vida referansi "
-    << REQUIRED_SCREW_FRAMES
-    << " karenin ortalamasi ile kilitlendi."
-    << std::endl;
-        //--------------------------------------------------
-        // VIDA PIXEL -> GERCEK DUNYA (mm) HOMOGRAFISI
-        //--------------------------------------------------
-
-        if(lockedScrewQuad->size() == 4)
-        {
-            std::vector<cv::Point2f> worldPoints = {
-                {0.0f, 0.0f},
-                {222.5f, 0.0f},
-                {222.5f, 150.0f},
-                {0.0f, 150.0f}
-            };
-
-            *homographyMatrix =
-                cv::findHomography(
-                    *lockedScrewQuad,
-                    worldPoints
-                );
-
-            if(!homographyMatrix->empty())
-            {
-                *homographyReady = true;
-                *stage2Active = true;
-
-                std::cout
-                    << "[GUI] Homografi olusturuldu."
-                    << std::endl;
-
-                std::cout
-                    << "[GUI] ASAMA 2 baslatildi."
-                    << std::endl;
-            }
-            else
-            {
-                *homographyReady = false;
-                *stage2Active = false;
-
-                std::cerr
-                    << "[GUI] Homografi hesaplanamadi."
-                    << std::endl;
-            }
-        }
-    }
-
-    screwStatus->setText("✓ Vida Referansi");
-
-    if(*stage2Active)
-    {
-        direction->setText(
-            "ASAMA 2 - PROJEKSIYON ARANIYOR..."
-        );
-    }
-    else
-    {
-        direction->setText(
-            "VIDA REFERANSI BULUNDU - HOMOGRAFI HATASI"
-        );
-    }
-}
-    else
-    {
-        screwStatus->setText(
-            QString("○ Vida Referansi %1/%2")
-                .arg(*goodScrewFrames)
-                .arg(REQUIRED_SCREW_FRAMES)
-        );
-
-        direction->setText(
-            "REFERANS VIDALAR ARANIYOR..."
-        );
-    }
-
 
     //--------------------------------------------------
     // ASAMA 2 - PROJEKSIYON TESPITI VE OLCUM
@@ -732,67 +759,354 @@ else
                 QString("Aci : %1 derece")
                     .arg(measurement.rotationDeg, 0, 'f', 2)
             );
-
-            //--------------------------------------------------
-            // Konturu kamera goruntusunde goster
-            //--------------------------------------------------
-
-           //--------------------------------------------------
-// HEDEF PROJEKSIYON CERCEVESI
+//--------------------------------------------------
+// ASAMA 2 - GERCEK PROJEKSIYON SINIRI + KENAR OLCULERI
 //--------------------------------------------------
 
-// 4 vida referans alaninin merkezi
-const float targetCenterX = 222.5f / 2.0f;
-const float targetCenterY = 150.0f / 2.0f;
-
-// DLP'nin gercek fiziksel boyutu
-const float halfWidth  = selectedModel.widthMM  / 2.0f;
-const float halfHeight = selectedModel.heightMM / 2.0f;
-
-// Hedefin mm cinsinden 4 kosesi:
-// TL, TR, BR, BL
-std::vector<cv::Point2f> targetWorldCorners = {
-    {targetCenterX - halfWidth, targetCenterY - halfHeight},
-    {targetCenterX + halfWidth, targetCenterY - halfHeight},
-    {targetCenterX + halfWidth, targetCenterY + halfHeight},
-    {targetCenterX - halfWidth, targetCenterY + halfHeight}
-};
-
-// GUI'deki homography:
-// kamera pikseli -> gercek dunya mm
-//
-// Hedefi kameraya cizebilmek icin tersine ihtiyacimiz var:
-// gercek dunya mm -> kamera pikseli
-cv::Mat inverseHomography = homographyMatrix->inv();
-
-std::vector<cv::Point2f> targetImageCorners;
-
-cv::perspectiveTransform(
-    targetWorldCorners,
-    targetImageCorners,
-    inverseHomography
-);
-
-if(targetImageCorners.size() == 4)
+if(measurement.imageCorners.size() == 4)
 {
-    // Simdilik hedef sari.
-    // Bir sonraki adimda OK oldugunda yesile cevirecegiz.
-    cv::Scalar targetColor(0, 255, 255);
+    const auto& c = measurement.imageCorners;
 
-    for(int i = 0; i < 4; ++i)
-    {
-        cv::line(
-            display,
-            targetImageCorners[i],
-            targetImageCorners[(i + 1) % 4],
-            targetColor,
-            3,
-            cv::LINE_AA
-        );
-    }
+    cv::Scalar projectionColor(0, 255, 255); // sari yazi
+
+     
+    //--------------------------------------------------
+    // KENAR ORTA NOKTALARI
+    //--------------------------------------------------
+
+    cv::Point2f topMid =
+        (c[0] + c[1]) * 0.5f;
+
+    cv::Point2f rightMid =
+        (c[1] + c[2]) * 0.5f;
+
+    cv::Point2f bottomMid =
+        (c[2] + c[3]) * 0.5f;
+
+    cv::Point2f leftMid =
+        (c[3] + c[0]) * 0.5f;
+
+    //--------------------------------------------------
+    // OLCULEN GERCEK KENAR UZUNLUKLARI
+    //--------------------------------------------------
+
+    std::string topText =
+        cv::format("%.2f mm", measurement.edge01MM);
+
+    std::string rightText =
+        cv::format("%.2f mm", measurement.edge12MM);
+
+    std::string bottomText =
+        cv::format("%.2f mm", measurement.edge23MM);
+
+    std::string leftText =
+        cv::format("%.2f mm", measurement.edge30MM);
+
+    //--------------------------------------------------
+    // UST KENAR
+    //--------------------------------------------------
+
+    cv::putText(
+        display,
+        topText,
+        cv::Point(
+            cvRound(topMid.x - 45),
+            cvRound(topMid.y - 12)
+        ),
+        cv::FONT_HERSHEY_SIMPLEX,
+        0.65,
+        cv::Scalar(0, 255, 255),
+        2,
+        cv::LINE_AA
+    );
+
+    //--------------------------------------------------
+    // ALT KENAR
+    //--------------------------------------------------
+
+    cv::putText(
+        display,
+        bottomText,
+        cv::Point(
+            cvRound(bottomMid.x - 45),
+            cvRound(bottomMid.y + 25)
+        ),
+        cv::FONT_HERSHEY_SIMPLEX,
+        0.65,
+        cv::Scalar(0, 255, 255),
+        2,
+        cv::LINE_AA
+    );
+
+    //--------------------------------------------------
+    // SOL KENAR
+    //--------------------------------------------------
+
+    cv::putText(
+        display,
+        leftText,
+        cv::Point(
+            cvRound(leftMid.x + 10),
+            cvRound(leftMid.y)
+        ),
+        cv::FONT_HERSHEY_SIMPLEX,
+        0.65,
+        cv::Scalar(0, 255, 255),
+        2,
+        cv::LINE_AA
+    );
+
+    //--------------------------------------------------
+    // SAG KENAR
+    //--------------------------------------------------
+
+    cv::putText(
+        display,
+        rightText,
+        cv::Point(
+            cvRound(rightMid.x - 100),
+            cvRound(rightMid.y)
+        ),
+        cv::FONT_HERSHEY_SIMPLEX,
+        0.65,
+        cv::Scalar(0, 255, 255),
+        2,
+        cv::LINE_AA
+    );
 }
 
-            
+//--------------------------------------------------
+// ASAMA 2 - DIKLIK KONTROLU
+//--------------------------------------------------
+
+if(*perpendicularStage != PerpendicularStage::COMPLETED)
+{
+    //--------------------------------------------------
+    // 1. ADIM: UST - ALT
+    //--------------------------------------------------
+
+    if(*perpendicularStage == PerpendicularStage::TOP_BOTTOM)
+    {
+        double topBottomDiff =
+            measurement.edge01MM - measurement.edge23MM;
+
+        double absDiff = std::abs(topBottomDiff);
+
+        if(absDiff <= PERPENDICULAR_TOLERANCE_MM)
+        {
+            (*perpendicularStableFrames)++;
+
+            // Esitlik gercekten kararlı hale geldiyse kilitle.
+            if(*perpendicularStableFrames >=
+               PERPENDICULAR_REQUIRED_FRAMES)
+            {
+                *lockedTopBottomMM =
+                    (measurement.edge01MM +
+                     measurement.edge23MM) / 2.0;
+
+                *topBottomValueLocked = true;
+
+                direction->setText(
+                    QString(
+                        "✓ UST-ALT ESIT | Ust: %1 mm | Alt: %2 mm | Fark: %3 mm"
+                    )
+                    .arg(measurement.edge01MM, 0, 'f', 2)
+                    .arg(measurement.edge23MM, 0, 'f', 2)
+                    .arg(absDiff, 0, 'f', 2)
+                );
+
+                direction->setStyleSheet(
+                    "font-size: 24px;"
+                    "font-weight: bold;"
+                    "background-color: #b7f7b7;"
+                    "color: #006400;"
+                    "border-radius: 8px;"
+                    "padding: 10px;"
+                );
+
+                std::cout
+                    << "[DIKLIK] UST-ALT ESITLENDI: "
+                    << *lockedTopBottomMM
+                    << " mm"
+                    << std::endl;
+
+                *perpendicularStage =
+                    PerpendicularStage::LEFT_RIGHT;
+
+                *perpendicularStableFrames = 0;
+            }
+        }
+        else
+        {
+            *perpendicularStableFrames = 0;
+
+            // Esitlik bozulduysa eski kilit artik gecerli degil.
+            *topBottomValueLocked = false;
+
+            (*guiUpdateCounter)++;
+
+            if(*guiUpdateCounter >= GUI_UPDATE_EVERY_N_FRAMES)
+            {
+                *guiUpdateCounter = 0;
+
+                if(topBottomDiff > 0.0)
+                {
+                    direction->setText(
+                        QString(
+                            "↑  YUKARI HAREKET ETTIR  |  "
+                            "Ust: %1 mm  Alt: %2 mm  |  Fark: %3 mm"
+                        )
+                        .arg(measurement.edge01MM, 0, 'f', 2)
+                        .arg(measurement.edge23MM, 0, 'f', 2)
+                        .arg(absDiff, 0, 'f', 2)
+                    );
+                }
+                else
+                {
+                    direction->setText(
+                        QString(
+                            "↓  ASAGI HAREKET ETTIR  |  "
+                            "Ust: %1 mm  Alt: %2 mm  |  Fark: %3 mm"
+                        )
+                        .arg(measurement.edge01MM, 0, 'f', 2)
+                        .arg(measurement.edge23MM, 0, 'f', 2)
+                        .arg(absDiff, 0, 'f', 2)
+                    );
+                }
+
+                direction->setStyleSheet(
+                    "font-size: 24px;"
+                    "font-weight: bold;"
+                    "background-color: #fff3b0;"
+                    "color: #7a4b00;"
+                    "border-radius: 8px;"
+                    "padding: 10px;"
+                );
+            }
+        }
+    }
+
+    //--------------------------------------------------
+    // 2. ADIM: SOL - SAG
+    //--------------------------------------------------
+
+    else if(*perpendicularStage == PerpendicularStage::LEFT_RIGHT)
+    {
+        double leftRightDiff =
+            measurement.edge30MM - measurement.edge12MM;
+
+        double absDiff = std::abs(leftRightDiff);
+
+        if(absDiff <= PERPENDICULAR_TOLERANCE_MM)
+        {
+            (*perpendicularStableFrames)++;
+
+            if(*perpendicularStableFrames >=
+               PERPENDICULAR_REQUIRED_FRAMES)
+            {
+                *lockedLeftRightMM =
+                    (measurement.edge30MM +
+                     measurement.edge12MM) / 2.0;
+
+                *leftRightValueLocked = true;
+
+                direction->setText(
+                    QString(
+                        "✓ SOL-SAG ESIT | Sol: %1 mm | Sag: %2 mm | Fark: %3 mm"
+                    )
+                    .arg(measurement.edge30MM, 0, 'f', 2)
+                    .arg(measurement.edge12MM, 0, 'f', 2)
+                    .arg(absDiff, 0, 'f', 2)
+                );
+
+                direction->setStyleSheet(
+                    "font-size: 24px;"
+                    "font-weight: bold;"
+                    "background-color: #b7f7b7;"
+                    "color: #006400;"
+                    "border-radius: 8px;"
+                    "padding: 10px;"
+                );
+
+                std::cout
+                    << "[DIKLIK] SOL-SAG ESITLENDI: "
+                    << *lockedLeftRightMM
+                    << " mm"
+                    << std::endl;
+
+                // SOL-SAG esitlendi.
+                // ASAMA 3 su an kapali.
+                // Tekrar UST-ALT kontrolune donerek
+                // dikligi surekli kontrol ediyoruz.
+                *perpendicularStage =
+                    PerpendicularStage::TOP_BOTTOM;
+
+                *perpendicularStableFrames = 0;
+
+                std::cout
+                    << "[DIKLIK] SOL-SAG TAMAM. "
+                    << "UST-ALT TEKRAR KONTROL EDILIYOR."
+                    << std::endl;
+            }
+        }
+        else
+        {
+            *perpendicularStableFrames = 0;
+
+            *leftRightValueLocked = false;
+
+            (*guiUpdateCounter)++;
+
+            if(*guiUpdateCounter >= GUI_UPDATE_EVERY_N_FRAMES)
+            {
+                *guiUpdateCounter = 0;
+
+                if(leftRightDiff > 0.0)
+                {
+                    direction->setText(
+                        QString(
+                            "←  SOLA HAREKET ETTIR  |  "
+                            "Sol: %1 mm  Sag: %2 mm  |  Fark: %3 mm"
+                        )
+                        .arg(measurement.edge30MM, 0, 'f', 2)
+                        .arg(measurement.edge12MM, 0, 'f', 2)
+                        .arg(absDiff, 0, 'f', 2)
+                    );
+                }
+                else
+                {
+                    direction->setText(
+                        QString(
+                            "→  SAGA HAREKET ETTIR  |  "
+                            "Sol: %1 mm  Sag: %2 mm  |  Fark: %3 mm"
+                        )
+                        .arg(measurement.edge30MM, 0, 'f', 2)
+                        .arg(measurement.edge12MM, 0, 'f', 2)
+                        .arg(absDiff, 0, 'f', 2)
+                    );
+                }
+
+                direction->setStyleSheet(
+                    "font-size: 24px;"
+                    "font-weight: bold;"
+                    "background-color: #fff3b0;"
+                    "color: #7a4b00;"
+                    "border-radius: 8px;"
+                    "padding: 10px;"
+                );
+            }
+        }
+    }
+}          
+
+//--------------------------------------------------
+// ASAMA 3 - MERKEZLEME / HIZALAMA
+// Sadece diklik tamamlandiktan sonra calisir.
+//--------------------------------------------------
+
+if(false && *perpendicularStage == PerpendicularStage::COMPLETED)
+{
+
             //--------------------------------------------------
 // YENI HIZALAMA SONUCUNU HESAPLA
 //--------------------------------------------------
@@ -804,62 +1118,207 @@ updateAlignmentStatus(
 );
 
 //--------------------------------------------------
-// YONLENDIRME KILIDI
+// ADIM ADIM HIZALAMA KILIDI
 //--------------------------------------------------
 
+// Yeni bir komut baslat
 if(!*alignmentLocked)
 {
-// Ilk komutu kabul et
-*lockedAlignment = calculatedAlignment;
+    *lockedAlignment = calculatedAlignment;
+    *alignmentStepCompleted = false;
+    *alignmentCompletedFrames = 0;
+    *alignmentLocked = true;
 
-*alignmentStartCenter =
-    measurement.centerMM;
-
-*alignmentStartAngle =
-    measurement.rotationDeg;
-
-*alignmentLocked = true;
+    // Bu degerler debug / takip icin tutuluyor
+    *alignmentStartCenter = measurement.centerMM;
+    *alignmentStartAngle  = measurement.rotationDeg;
 }
-else
-{
-// Komut verildiginden beri projeksiyon
-// ne kadar hareket etti?
-double moveDistance =
-    cv::norm(
-        measurement.centerMM -
-        *alignmentStartCenter
-    );
-
-double angleChange =
-    std::abs(
-        measurement.rotationDeg -
-        *alignmentStartAngle
-    );
 
 //--------------------------------------------------
-// Kullanici gercekten bir hamle yaptiysa
-// yeni yonlendirmeyi kabul et
+// MEVCUT KOMUT GERCEKTEN TAMAMLANDI MI?
+//--------------------------------------------------
+//--------------------------------------------------
+// HIZALAMA TAMAMLANDIKTAN SONRA BOZULDU MU?
 //--------------------------------------------------
 
-if(moveDistance > COMMAND_MOVE_THRESHOLD_MM ||
-   angleChange > COMMAND_ANGLE_THRESHOLD_DEG)
+if(*lockedAlignment == AlignmentStatus::OK &&
+    !*alignmentStepCompleted)
+ {
+     if(calculatedAlignment != AlignmentStatus::OK)
+     {
+         (*alignmentLostFrames)++;
+ 
+         std::cout
+             << "[ALIGNMENT] Hizalama disina cikma: "
+             << *alignmentLostFrames
+             << "/"
+             << ALIGNMENT_LOST_REQUIRED_FRAMES
+             << std::endl;
+ 
+         // Gercekten bozulduguna emin olduktan sonra
+         // yeniden yonlendirme baslat.
+         if(*alignmentLostFrames >=
+            ALIGNMENT_LOST_REQUIRED_FRAMES)
+         {
+             *lockedAlignment = calculatedAlignment;
+ 
+             *alignmentStepCompleted = false;
+             *alignmentCompletedFrames = 0;
+             *alignmentLostFrames = 0;
+ 
+             *alignmentStartCenter =
+                 measurement.centerMM;
+ 
+             *alignmentStartAngle =
+                 measurement.rotationDeg;
+ 
+             std::cout
+                 << "[ALIGNMENT] Hizalama bozuldu. "
+                 << "Yeni yonlendirme baslatildi."
+                 << std::endl;
+         }
+     }
+     else
+     {
+         // Hala hizaliysa sayaci sifirla.
+         *alignmentLostFrames = 0;
+     }
+ }
+
+if(!*alignmentStepCompleted)
 {
-    *lockedAlignment =
-        calculatedAlignment;
+    bool stepFinished = false;
 
-    *alignmentStartCenter =
-        measurement.centerMM;
+    switch(*lockedAlignment)
+    {
+        //--------------------------------------------------
+        // YATAY HIZALAMA
+        //--------------------------------------------------
+        case AlignmentStatus::MOVE_LEFT:
+        case AlignmentStatus::MOVE_RIGHT:
+        {
+            constexpr double TARGET_X = 220.41 / 2.0;
 
-    *alignmentStartAngle =
-        measurement.rotationDeg;
+            double xError =
+                std::abs(measurement.centerMM.x - TARGET_X);
+
+            if(xError <= CENTER_TOLERANCE_MM)
+                stepFinished = true;
+
+            break;
+        }
+
+        //--------------------------------------------------
+        // DIKEY HIZALAMA
+        //--------------------------------------------------
+        case AlignmentStatus::MOVE_UP:
+        case AlignmentStatus::MOVE_DOWN:
+        {
+            constexpr double TARGET_Y = 145.60 / 2.0;
+
+            double yError =
+                std::abs(measurement.centerMM.y - TARGET_Y);
+
+            if(yError <= CENTER_TOLERANCE_MM)
+                stepFinished = true;
+
+            break;
+        }
+
+        //--------------------------------------------------
+        // MESAFE / BOYUT HIZALAMA
+        //--------------------------------------------------
+        case AlignmentStatus::MOVE_FORWARD:
+        case AlignmentStatus::MOVE_BACKWARD:
+        {
+            double nominalAvg =
+                (selectedModel.widthMM +
+                 selectedModel.heightMM) / 2.0;
+
+            double measuredAvg =
+                (measurement.widthMM +
+                 measurement.heightMM) / 2.0;
+
+            double sizeDiffPct =
+                (nominalAvg > 1e-6)
+                ? std::abs(
+                    (measuredAvg - nominalAvg) /
+                    nominalAvg * 100.0
+                  )
+                : 0.0;
+
+            if(sizeDiffPct <= SIZE_TOLERANCE_PCT)
+                stepFinished = true;
+
+            break;
+        }
+
+        //--------------------------------------------------
+        // DONUS HIZALAMA
+        //--------------------------------------------------
+        case AlignmentStatus::ROTATE_CW:
+        case AlignmentStatus::ROTATE_CCW:
+        {
+            if(std::abs(measurement.rotationDeg)
+               <= ANGLE_TOLERANCE_DEG)
+            {
+                stepFinished = true;
+            }
+
+            break;
+        }
+
+        //--------------------------------------------------
+        // ZATEN TAM HIZALI
+        //--------------------------------------------------
+        case AlignmentStatus::OK:
+        {
+            break;
+        }
+
+        default:
+            break;
+    }
+
+    //--------------------------------------------------
+    // BU ADIM TAMAMLANDI
+    //--------------------------------------------------
+
+    if(stepFinished)
+    {
+        *alignmentStepCompleted = true;
+        *alignmentCompletedFrames = 0;
+    }
 }
+
+//--------------------------------------------------
+// TAMAMLANAN ADIMI BIR SURE YESIL GOSTER
+//--------------------------------------------------
+
+if(*alignmentStepCompleted)
+{
+    (*alignmentCompletedFrames)++;
+
+    if(*alignmentCompletedFrames >=
+       ALIGNMENT_COMPLETED_DISPLAY_FRAMES)
+    {
+        // Artik siradaki gerekli hareketi hesapla
+        *lockedAlignment = calculatedAlignment;
+
+        *alignmentStepCompleted = false;
+        *alignmentCompletedFrames = 0;
+
+        *alignmentStartCenter = measurement.centerMM;
+        *alignmentStartAngle  = measurement.rotationDeg;
+    }
 }
 
-// GUI artik anlik sonucu degil,
-// kilitlenmis sonucu kullanacak.
+//--------------------------------------------------
+// GUI'DE GOSTERILECEK DURUM
+//--------------------------------------------------
+
 AlignmentStatus alignment =
-*lockedAlignment;
-
+    *lockedAlignment;
 std::string turkishDirection =
 alignmentStatusToTurkish(
     alignment
@@ -955,6 +1414,7 @@ alignmentStatusToTurkish(
                 );
             }
         }
+        }
         else
         {
             projectionStatus->setText(
@@ -1029,6 +1489,22 @@ QObject::connect(stopButton, &QPushButton::clicked, [=]() {
 
     cameraStatus->setText("○ Kamera");
     direction->setText("SISTEM DURDURULDU");
+
+    // FIX (manuel vida referansi): DURDUR sonrasi tekrar SISTEMI BASLAT'a
+    // basildiginda temiz bir durumdan baslasin.
+    manualScrewPoints->clear();
+    lockedScrewQuad->clear();
+    *screwReferenceLocked = false;
+    *homographyReady = false;
+    *stage2Active = false;
+    *alignmentLocked = false;
+    *hasLastValidMeasurement = false;
+
+    screwStatus->setText("○ Vida Referansi");
+    projectionStatus->setText("○ Projeksiyon Tespiti");
+    widthLabel->setText("Genislik : -- mm");
+    heightLabel->setText("Yukseklik : -- mm");
+    angleLabel->setText("Aci : -- derece");
 });
     window.setCentralWidget(central);
     window.show();

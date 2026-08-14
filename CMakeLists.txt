@@ -18,6 +18,7 @@ add_executable(MachineVision
 target_link_libraries(MachineVision
     ${OpenCV_LIBS}
 )
+set(CMAKE_AUTOMOC ON)
 
 add_executable(Calibration
     calibration.cpp
@@ -32,5 +33,27 @@ add_executable(Homography
 )
 
 target_link_libraries(Homography
+    ${OpenCV_LIBS}
+)
+add_executable(ScrewDetection screw_detection.cpp)
+
+target_link_libraries(ScrewDetection
+    ${OpenCV_LIBS}
+)
+# --------------------------------------------------
+# Qt masaustu arayuzu
+# --------------------------------------------------
+
+find_package(Qt6 REQUIRED COMPONENTS Widgets)
+
+add_executable(MachineVisionGUI
+    gui_main.cpp
+    screw_detector.cpp
+    measurement_engine.cpp
+    clickable_label.hpp
+)
+
+target_link_libraries(MachineVisionGUI
+    Qt6::Widgets
     ${OpenCV_LIBS}
 )

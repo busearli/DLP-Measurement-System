@@ -15,8 +15,8 @@ constexpr double SIZE_TOLERANCE_PCT  = 3.0;
 constexpr double SIZE_SUSPICIOUS_PCT = 35.0;
 
 // Vida referans alaninin fiziksel boyutu
-constexpr double SCREW_FRAME_WIDTH_MM  = 222.5;
-constexpr double SCREW_FRAME_HEIGHT_MM = 150.0;
+constexpr double SCREW_FRAME_WIDTH_MM  = 220.41;
+constexpr double SCREW_FRAME_HEIGHT_MM = 145.60;
 
 //--------------------------------------------------
 // DLP MODEL
@@ -49,6 +49,13 @@ struct MeasurementData
     double widthMM = 0.0;
     double heightMM = 0.0;
 
+    // Diklik ayari icin projeksiyonun 4 kenari
+    // imageCorners sirasi: TL -> TR -> BR -> BL
+    double edge01MM = 0.0;   // TL -> TR
+    double edge12MM = 0.0;   // TR -> BR
+    double edge23MM = 0.0;   // BR -> BL
+    double edge30MM = 0.0;   // BL -> TL
+
     cv::Point2d centerMM = cv::Point2d(0.0, 0.0);
 
     double pitch = 0.0;
@@ -66,6 +73,7 @@ struct MeasurementData
     bool mmValid = false;
     bool sizeSuspicious = false;
 };
+
 //--------------------------------------------------
 // OLCUM STABILIZASYONU
 //--------------------------------------------------

@@ -15,8 +15,27 @@
 #include <algorithm>
 #include <limits>
 #include <cmath>
+#include <numeric>
+//--------------------------------------------------
+// AUTOMATIC SCREW REFERENCE SETTINGS
+//--------------------------------------------------
 
+const float SCREW_WIDTH_MM  = 222.5f;
+const float SCREW_HEIGHT_MM = 150.0f;
 
+const double MAX_ACCEPTABLE_REPROJ_MM = 0.3;
+
+const int STABILITY_FRAMES = 12;
+const double STABILITY_TOL_PX = 2.0;
+
+const int MAX_MISSED_FRAMES = 5;
+
+const char* SCREW_NAMES[4] = {
+    "TL",
+    "TR",
+    "BR",
+    "BL"
+};
 //--------------------------------------------------
 // Debug / Verbose Logging
 //--------------------------------------------------
@@ -194,15 +213,6 @@ AlignmentStatus g_status = AlignmentStatus::NO_DATA;
 // koordinat sisteminin ORIJININI belgelemek icin tutuluyor: (0,0) noktasi,
 // Homography.cpp'de tiklanan A4 kagidinin SOL-UST kosesidir. Gercek
 // homografi hesabi homography.cpp icinde A4_WIDTH/A4_HEIGHT ile yapilir.
-//
-// ONEMLI (kalibrasyon/olcum tutarliligi icin operasyonel kural):
-// A4 kagidi, Homography programi calistirilirken, DLP'nin projekte
-// edildigi/olculdugu YUZEYIN TAM UZERINE (ayni fiziksel duzleme) konmalidir.
-// Homografi TEK BIR duzlem icin gecerlidir; A4 kagidi farkli bir mesafede/
-// derinlikte (Z) tutulup DLP yuzeyi baska bir duzlemde olculuyorsa,
-// piksel->mm donusumu sistematik ve BUYUK hata verir (ekran goruntusundeki
-// "Width: 229mm / secilen model 124.8mm" gibi mantiksiz sonuclar tam olarak
-// bu sebepten olusur).
 
 const float A4_WIDTH  = 210.0f;
 const float A4_HEIGHT = 297.0f;
@@ -265,49 +275,134 @@ cv::Mat captureFrame(cv::VideoCapture& cap)
 //--------------------------------------------------
 // Detect Blue/Color Region (HSV) - Saha testinde eklendi
 //--------------------------------------------------
-// FIX: Onceki oturumda kullaniciya ait deneysel kodda iki hata vardi:
-//   1) cv::inRange(hsv, lowerBlue, upperBlue, mask) cagrisinda lowerBlue/
-//      upperBlue TANIMSIZDI (lower/upper diye tanimlanmisti) - derlenmiyordu.
-//   2) setMouseCallback her karede yeniden kaydediliyordu ve callback,
-//      DONGU ICINDE HER KEZ YENIDEN OLUSAN yerel bir cv::Mat'in adresini
-//      (&hsv) yakaliyordu - tiklama aninda o adres gecersiz/degismis
-//      olabilirdi (sarkan pointer / UB).
-// Asagida: HSV degerleri artik "Mask (debug)" penceresindeki 6 trackbar'dan
-// canli okunuyor (yeniden derleme gerekmeden ayar yapilabiliyor), mouse
-// callback ise TEK SEFER, dongu DISINDA kaydediliyor ve kalici (adresi
-// sabit) bir cv::Mat'e (HsvCalibState::hsvFrame) isaret ediyor.
 
 int g_hMin = 100, g_hMax = 140;
 int g_sMin = 40,  g_sMax = 255;
 int g_vMin = 60,  g_vMax = 255;
 
+// YENI: Otsu tabanli otomatik V esigi kullanildiginda, hangi esigin secildigini
+// ekranda gostermek/loglamak icin. Trackbar'daki g_vMin/g_vMax adaptif moddayken
+// KULLANILMAZ (sadece Sabit HSV modunda anlamlidir), ama arayuzde gormek icin
+// tutuluyor.
+int g_lastOtsuVThresh = 0;
+
 enum class DetectionMode
 {
-    BRIGHTNESS_THRESHOLD,   // eski yontem: tam beyaz/parlak dikdortgen
-    HSV_COLOR_RANGE         // yeni yontem: DLP'nin belirli renkteki (orn. mavi) isigi
+    BRIGHTNESS_THRESHOLD,     // eski yontem: tam beyaz/parlak dikdortgen
+    HSV_COLOR_RANGE,          // sabit HSV araligi (trackbar'lardan)
+    HSV_ADAPTIVE              // YENI: Hue sabit/manuel, V esigi HER KAREDE Otsu ile otomatik
 };
 
-// FIX (saha testi - cam ustunden asagidan yansitilan DLP): parlaklik esigi
-// yontemi, ortamdaki her parlak/yansiyan yuzeyi (metal govde, vida, cam
-// yansimasi) de "beyaz" sayabiliyordu. DLP isigi belirli bir RENKTE
-// (ekran goruntulerinde mavi) oldugu icin HSV renk araligi ile filtrelemek
-// cok daha secici. Varsayilan artik HSV_COLOR_RANGE.
-DetectionMode g_detectionMode = DetectionMode::HSV_COLOR_RANGE;
+// Varsayilan artik adaptif mod: ortam isigi degistiginde (gunduz/gece,
+// farkli aydinlatma) elle trackbar oynatma ihtiyacini azaltir.
+DetectionMode g_detectionMode = DetectionMode::HSV_ADAPTIVE;
 
 cv::Mat detectColorRegion(const cv::Mat& hsv, int hMin, int hMax, int sMin, int sMax, int vMin, int vMax)
 {
-    // FIX (saha testi - kontur ust kenari tirtikli, olcum %5-10 fazla
-    // cikiyor): detectBrightRegion (eski yontem) threshold'dan ONCE
-    // GaussianBlur uyguluyordu, bu fonksiyon eskiden uygulamiyordu - ham
-    // piksellerde HSV sinirinda tek tek pikseller titresip dalgali/tirtikli
-    // bir maske kenari uretiyordu. Ayni blur adimini burada da uygulayarak
-    // (ozellikle S/V kanallarindaki gurultu) kenari yumusatiyoruz.
     cv::Mat blurred;
     cv::GaussianBlur(hsv, blurred, cv::Size(5, 5), 0);
 
     cv::Mat mask;
     cv::inRange(blurred, cv::Scalar(hMin, sMin, vMin), cv::Scalar(hMax, sMax, vMax), mask);
     return mask;
+}
+
+// YENI: Adaptif tespit - Hue bandi (manuel/otomatik kalibre edilmis) sabit
+// kabul edilir, ama V (parlaklik) esigi HER KAREDE o karenin kendi
+// histogramindan Otsu yontemiyle otomatik hesaplanir. Bu, ortam isigi
+// degistikce (gunduz/gece, farkli lamba) trackbar'a dokunmadan uyum
+// saglanmasini saglar - cunku Otsu, "koyu arka plan + parlak desen" gibi
+// iki-tepeli (bimodal) bir dagilimda esigi otomatik ortaya bulur.
+cv::Mat detectColorRegionAdaptive(
+    const cv::Mat& hsv,
+    int hMin, int hMax,
+    int sMin,
+    int vMinFloor,          // YENI: elle dogrulanmis guvenli minimum V - Otsu bunun ALTINA dusemez
+    int& outUsedVThresh)
+{
+    cv::Mat blurred;
+    cv::GaussianBlur(hsv, blurred, cv::Size(5, 5), 0);
+
+    std::vector<cv::Mat> channels;
+    cv::split(blurred, channels);
+    const cv::Mat& hueChan = channels[0];
+    const cv::Mat& satChan = channels[1];
+    const cv::Mat& valChan = channels[2];
+
+    cv::Mat hueMask;
+    cv::inRange(hueChan, hMin, hMax, hueMask);
+
+    cv::Mat satMask;
+    cv::threshold(satChan, satMask, sMin, 255, cv::THRESH_BINARY);
+
+    // FIX (regresyon duzeltmesi): Otsu istatistiksel olarak "en iyi ikiye
+    // bolen" esigi bulur, ama bu her zaman "en dogru olcumu veren" esik
+    // degildir. Kullanicinin elle deneme-hatayla bulup dogruladigi bir
+    // minimum V degeri varsa (g_vMin trackbar'i / kaydedilmis hsv_settings.yml),
+    // Otsu bu degerin ALTINA asla dusmesin - sadece bu minimumun UZERINDE
+    // ince ayar yapsin. Boylece Otsu, bilinen iyi bir noktadan daha
+    // "gevsek" (halo'yu da iceren) bir esik secmez.
+    cv::Mat valMask;
+    double otsuThresh = cv::threshold(valChan, valMask, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
+
+    double effectiveThresh = std::max(otsuThresh, static_cast<double>(vMinFloor));
+    cv::threshold(valChan, valMask, effectiveThresh, 255, cv::THRESH_BINARY);
+
+    outUsedVThresh = static_cast<int>(std::round(effectiveThresh));
+
+    cv::Mat mask;
+    cv::bitwise_and(hueMask, satMask, mask);
+    cv::bitwise_and(mask, valMask, mask);
+
+    return mask;
+}
+
+// YENI: Program acilisinda (veya istendiginde 'a' tusuyla) sahnedeki en
+// parlak bolgenin (Otsu esiginin ustunde kalan pikseller) Hue degerlerini
+// orneklyip otomatik bir Hue araligi onerir. Boylece H trackbar'ini elle
+// ayarlama ihtiyaci da buyuk olcude ortadan kalkar - sadece isik/pattern
+// ekranda goruntudeyken cagirmak yeterlidir.
+bool autoCalibrateHueBand(const cv::Mat& hsvFrame, int& outHMin, int& outHMax, int marginDeg = 6)
+{
+    std::vector<cv::Mat> ch;
+    cv::split(hsvFrame, ch);
+
+    cv::Mat brightMask;
+    cv::threshold(ch[2], brightMask, 0, 255, cv::THRESH_BINARY | cv::THRESH_OTSU);
+
+    std::vector<uchar> hueSamples;
+    hueSamples.reserve(5000);
+
+    for(int y = 0; y < hsvFrame.rows; y += 3)
+    {
+        for(int x = 0; x < hsvFrame.cols; x += 3)
+        {
+            if(brightMask.at<uchar>(y, x) > 0)
+                hueSamples.push_back(ch[0].at<uchar>(y, x));
+        }
+    }
+
+    if(hueSamples.size() < 50)
+    {
+        std::cout << "[UYARI] Otomatik Hue kalibrasyonu icin yeterli parlak piksel bulunamadi "
+                     "(" << hueSamples.size() << " ornek). Isik/pattern ekranda gorunur oldugundan "
+                     "emin olun ve tekrar deneyin." << std::endl;
+        return false;
+    }
+
+    std::sort(hueSamples.begin(), hueSamples.end());
+    size_t n = hueSamples.size();
+
+    int p10 = hueSamples[static_cast<size_t>(n * 0.10)];
+    int p90 = hueSamples[static_cast<size_t>(n * 0.90)];
+
+    outHMin = std::max(0,   p10 - marginDeg);
+    outHMax = std::min(179, p90 + marginDeg);
+
+    std::cout << "[BILGI] Otomatik Hue kalibrasyonu: H[" << outHMin << " - " << outHMax
+              << "] (" << hueSamples.size() << " ornekten, p10=" << p10 << " p90=" << p90 << ")" << std::endl;
+
+    return true;
 }
 
 // Eski (brightness) yontem - 'm' tusuyla geri gecis icin korunuyor.
@@ -325,20 +420,75 @@ cv::Mat detectBrightRegion(const cv::Mat& gray, int thresholdValue)
 }
 
 //--------------------------------------------------
-// HSV Kalibrasyon Araci
+// HSV Ayarlarini Kaydet / Yukle (YENI)
 //--------------------------------------------------
-// Kullanim (calisirken):
-//   'i'/'I' -> "ICERI (pattern uzerinde)" ornek toplama modunu ac/kapat,
-//              bu moddayken pattern'in UZERINE 5-10 kez tiklayin
-//   'o'/'O' -> "DISARI (arka plan)" ornek toplama modunu ac/kapat,
-//              bu moddayken arka plana/metale 5-10 kez tiklayin
-//   'r'/'R' -> toplanan orneklerden onerilen H/S/V araligini konsola
-//              yazdirir (bu degerleri Mask (debug) penceresindeki
-//              trackbar'lara elle girin), sonra ornekleri temizler
+// Amac: program her acildiginda trackbar'lari sifirdan ayarlama ihtiyacini
+// ortadan kaldirmak. Bulunan degerler (manuel veya autoCalibrateHueBand /
+// Otsu tarafindan onerilen) bir .yml dosyasina yazilir, bir sonraki
+// acilista buradan okunur.
+
+bool loadHsvSettings(
+    const std::string& filename,
+    int& hMin, int& hMax,
+    int& sMin, int& sMax,
+    int& vMin, int& vMax)
+{
+    cv::FileStorage fs(filename, cv::FileStorage::READ);
+
+    if(!fs.isOpened())
+    {
+        std::cout << "[BILGI] " << filename << " bulunamadi, varsayilan HSV degerleri kullanilacak." << std::endl;
+        return false;
+    }
+
+    fs["h_min"] >> hMin;
+    fs["h_max"] >> hMax;
+    fs["s_min"] >> sMin;
+    fs["s_max"] >> sMax;
+    fs["v_min"] >> vMin;
+    fs["v_max"] >> vMax;
+    fs.release();
+
+    std::cout << "HSV ayarlari yuklendi: H[" << hMin << "-" << hMax
+              << "] S[" << sMin << "-" << sMax
+              << "] V[" << vMin << "-" << vMax << "]" << std::endl;
+
+    return true;
+}
+
+bool saveHsvSettings(
+    const std::string& filename,
+    int hMin, int hMax,
+    int sMin, int sMax,
+    int vMin, int vMax)
+{
+    cv::FileStorage fs(filename, cv::FileStorage::WRITE);
+
+    if(!fs.isOpened())
+    {
+        std::cout << "[UYARI] " << filename << " olusturulamadi, HSV ayarlari kaydedilemedi." << std::endl;
+        return false;
+    }
+
+    fs << "h_min" << hMin;
+    fs << "h_max" << hMax;
+    fs << "s_min" << sMin;
+    fs << "s_max" << sMax;
+    fs << "v_min" << vMin;
+    fs << "v_max" << vMax;
+    fs.release();
+
+    std::cout << "HSV ayarlari kaydedildi: " << filename << std::endl;
+    return true;
+}
+
+//--------------------------------------------------
+// HSV Kalibrasyon Araci (manuel, 'i'/'o'/'r' ile)
+//--------------------------------------------------
 
 struct HsvCalibState
 {
-    cv::Mat hsvFrame;                 // her karede guncellenir, ADRESI SABIT kalir
+    cv::Mat hsvFrame;
     bool collectingInside = false;
     bool collectingOutside = false;
     std::vector<cv::Vec3b> insideSamples;
@@ -443,6 +593,7 @@ void printSuggestedHsvRange(const HsvCalibState& state)
 
     std::cout << "=====================================\n" << std::endl;
 }
+
 cv::Mat cleanMask(const cv::Mat& mask)
 {
     cv::Mat opened;
@@ -603,6 +754,11 @@ bool lineIntersection(
 //==================================================
 // Fit Line From Points
 //==================================================
+// NOT: DIST_HUBER denenmisti ama gercek olcumlerde (hem width hem height
+// buyudu, %0.07/%0.71 -> %0.77/%2.8) DIST_L2'den daha KOTU sonuc verdi -
+// bu yuzden klasik DIST_L2'ye (en kucuk kareler) geri donuldu. Kisa/uzun
+// kenar asimetrisi icin asil cozum, mask kalitesini (Otsu tabani, S/V
+// ayari) iyilestirmek oldu - bkz. detectColorRegionAdaptive() ve vMinFloor.
 
 bool fitLineFromPoints(
     const std::vector<cv::Point2f>& points,
@@ -689,62 +845,58 @@ bool extractPreciseCorners(
     if(contour.size() < 20)
         return false;
 
-    //--------------------------------------------------
-// Fallback : FitLine
-//--------------------------------------------------
+    std::vector<cv::Point2f> top;
+    std::vector<cv::Point2f> right;
+    std::vector<cv::Point2f> bottom;
+    std::vector<cv::Point2f> left;
 
-std::vector<cv::Point2f> top;
-std::vector<cv::Point2f> right;
-std::vector<cv::Point2f> bottom;
-std::vector<cv::Point2f> left;
+    splitContourSides(
+        contour,
+        rect,
+        top,
+        right,
+        bottom,
+        left);
 
-splitContourSides(
-    contour,
-    rect,
-    top,
-    right,
-    bottom,
-    left);
+    cv::Vec4f topLine;
+    cv::Vec4f rightLine;
+    cv::Vec4f bottomLine;
+    cv::Vec4f leftLine;
 
-cv::Vec4f topLine;
-cv::Vec4f rightLine;
-cv::Vec4f bottomLine;
-cv::Vec4f leftLine;
+    if(!fitLineFromPoints(top, topLine))
+        return false;
 
-if(!fitLineFromPoints(top, topLine))
-    return false;
+    if(!fitLineFromPoints(right, rightLine))
+        return false;
 
-if(!fitLineFromPoints(right, rightLine))
-    return false;
+    if(!fitLineFromPoints(bottom, bottomLine))
+        return false;
 
-if(!fitLineFromPoints(bottom, bottomLine))
-    return false;
+    if(!fitLineFromPoints(left, leftLine))
+        return false;
 
-if(!fitLineFromPoints(left, leftLine))
-    return false;
+    cv::Point2f p0;
+    cv::Point2f p1;
+    cv::Point2f p2;
+    cv::Point2f p3;
 
-cv::Point2f p0;
-cv::Point2f p1;
-cv::Point2f p2;
-cv::Point2f p3;
+    if(!lineIntersection(topLine, leftLine, p0))
+        return false;
 
-if(!lineIntersection(topLine, leftLine, p0))
-    return false;
+    if(!lineIntersection(topLine, rightLine, p1))
+        return false;
 
-if(!lineIntersection(topLine, rightLine, p1))
-    return false;
+    if(!lineIntersection(bottomLine, rightLine, p2))
+        return false;
 
-if(!lineIntersection(bottomLine, rightLine, p2))
-    return false;
+    if(!lineIntersection(bottomLine, leftLine, p3))
+        return false;
 
-if(!lineIntersection(bottomLine, leftLine, p3))
-    return false;
+    corners = {p0, p1, p2, p3};
 
-corners = {p0, p1, p2, p3};
+    corners = orderCorners(corners);
 
-corners = orderCorners(corners);
-
-return true;
+    return true;
 }
 
 
@@ -978,6 +1130,16 @@ MeasurementData measureObject(
 
         if(worldPoints.size() == 4)
         {
+            // Projeksiyonun donusunu kamera goruntusune gore degil,
+// cihaz/homography koordinat sistemine gore hesapla.
+cv::Point2f topEdgeWorld = worldPoints[1] - worldPoints[0];
+
+double rotationRadWorld =
+    std::atan2(topEdgeWorld.y, topEdgeWorld.x);
+
+measurement.rotationDeg =
+    rotationRadWorld * 180.0 / CV_PI;
+
             double d01 = cv::norm(worldPoints[0] - worldPoints[1]);
             double d12 = cv::norm(worldPoints[1] - worldPoints[2]);
             double d23 = cv::norm(worldPoints[2] - worldPoints[3]);
@@ -1014,19 +1176,6 @@ MeasurementData measureObject(
             measurement.mmValid  = true;
         }
 
-        // FIX (KRITIK - ekranda gorulen "Width:229mm vs secili model 124.8mm"
-        // gibi anlamsiz sonuclar): Olculen mm boyutu, secilen DLP modelinin
-        // nominal boyutundan buyuk oranda sapiyorsa bu artik SESSIZCE kabul
-        // edilmiyor. Boyle bir sapma tipik olarak iki nedenden biriyle olusur:
-        //   1) Homography.cpp'de A4 kagidi, DLP olcum yuzeyiyle AYNI fiziksel
-        //      duzlemde degildi (farkli mesafe/derinlik) - homografi sadece
-        //      TEK bir duzlem icin gecerlidir.
-        //   2) Threshold/kontur yanlis bir parlak bolgeyi (goruntunun tamami
-        //      degil ama yanlis nesneyi) yakalamis olabilir.
-        // Bu durumda pose (pitch/roll) hesaplamasi da anlamsiz cikar (asagida
-        // gorulecegi gibi artik olculen degil, NOMINAL boyut kullaniliyor -
-        // ama yine de operatoru bariz sekilde yanlis bir olcumle yonlendirmemek
-        // icin measurement "supheli" olarak isaretleniyor).
         if(measurement.mmValid && selectedModel.widthMM > 1e-3f && selectedModel.heightMM > 1e-3f)
         {
             double wDiffPct = std::abs(measurement.widthMM  - selectedModel.widthMM)  / selectedModel.widthMM  * 100.0;
@@ -1071,22 +1220,6 @@ MeasurementData measureObject(
         double pitchDeg = 0.0;
         double rollDeg  = 0.0;
 
-        // FIX (KRITIK BUG - pitch=50 derece gibi anlamsiz sonuclarin asil
-        // nedeni buydu): solvePnP'ye "gercek dunya" nesne boyutu olarak
-        // ONCEDEN olculmus (ve homografi/duzlem hatasi yuzunden yanlis
-        // olabilecek) mm degeri veriliyordu. Oysa sistemin butun onculu su:
-        // operator HANGI DLP modelini hizaladigini zaten SECIYOR (bkz.
-        // selectDLPModel()) - yani nesnenin gercek fiziksel boyutu ONCEDEN
-        // BILINEN bir sabittir (selectedModel.widthMM/heightMM), olculerek
-        // BULUNMASI gereken bir sey degildir. Yanlis olculmus bir boyutu
-        // solvePnP'ye "gercek boyut" diye vermek, kendi kendini besleyen bir
-        // hataya yol aciyordu: hatali mm olcumu -> hatali pose varsayimi ->
-        // solvePnP, yanlis en-boy oranini 2B koseler ile uydurmaya calisirken
-        // KAMERAYA GORE ASIRI EGIK (ör. 50 derece pitch) bir cozume kayiyordu.
-        // Artik pose HER ZAMAN secilen modelin NOMINAL (bilinen dogru) boyutu
-        // ile hesaplaniyor; homografiden gelen mm olcumu ise sadece
-        // Width/Height/Diagonal raporlamasi ve hizalama (X/Y/mesafe) icin
-        // kullaniliyor - iki farkli amac birbirine karistirilmiyor.
         float poseWidth  = selectedModel.widthMM;
         float poseHeight = selectedModel.heightMM;
 
@@ -1135,42 +1268,43 @@ AlignmentStatus updateAlignmentStatus(
     if(!measurement.valid || !measurement.mmValid || !measurement.poseValid)
         return AlignmentStatus::NO_DATA;
 
-    // FIX: supheli boyut olcumuyle operatoru yanlis yonlendirmemek icin
-    // ayri, acik bir durum donduruluyor (bkz. measureObject icindeki
-    // sizeSuspicious kontrolu).
     if(measurement.sizeSuspicious)
         return AlignmentStatus::SIZE_MISMATCH;
 
-    // FIX (KRITIK REGRESYON): Buradaki hedef merkez YANLISLIKLA A4_WIDTH/2,
-    // A4_HEIGHT/2 (105mm, 148.5mm - A4 kagidinin kendi merkezi) olarak
-    // hesaplaniyordu. Ama ekranda cizilen yesil hedef kutusu (bkz.
-    // computeTargetOverlayPixels) VE formatAlignmentDetail() fonksiyonu
-    // HER IKISI DE secilen DLP modelinin kendi boyutunu (selectedModel.widthMM/2,
-    // selectedModel.heightMM/2) merkez olarak kullaniyor. Bu tutarsizlik yuzunden
-    // MOVE_LEFT/RIGHT/UP/DOWN karari, ekranda gorunen hedef kutusuyla VE panelde
-    // yazan "X Offset"/"Y Offset" degeriyle UYUSMUYORDU - operator "sola git"
-    // yazisini gorup saga giden bir kutuya bakabiliyordu. Dunya (mm) origini
-    // (A4 kagidinin sol-ust kosesi) ile DLP hedef alaninin merkezi FARKLI
-    // kavramlardir - hizalama HER ZAMAN secilen modele gore yapilmali.
-    double targetCenterX = selectedModel.widthMM  / 2.0;
-    double targetCenterY = selectedModel.heightMM / 2.0;
+   // 4 referans vidanin olusturdugu fiziksel alan
+constexpr double SCREW_FRAME_WIDTH_MM  = 222.5;
+constexpr double SCREW_FRAME_HEIGHT_MM = 150.0;
 
-    if(measurement.centerMM.x < targetCenterX - CENTER_TOLERANCE_MM)
+// Gercek hedef: 4 vidanin geometrik merkezi
+const double targetCenterX = SCREW_FRAME_WIDTH_MM  / 2.0; // 111.25 mm
+const double targetCenterY = SCREW_FRAME_HEIGHT_MM / 2.0; // 75.00 mm
+
+// Projeksiyon merkezinin hedef merkezden sapmasi
+const double dx = measurement.centerMM.x - targetCenterX;
+const double dy = measurement.centerMM.y - targetCenterY;
+
+const bool xOutside = std::abs(dx) > CENTER_TOLERANCE_MM;
+const bool yOutside = std::abs(dy) > CENTER_TOLERANCE_MM;
+
+// Iki eksen de tolerans disindaysa,
+// once daha buyuk sapmayi duzelt
+if(xOutside || yOutside)
+{
+    if(xOutside && (!yOutside || std::abs(dx) >= std::abs(dy)))
     {
-        return AlignmentStatus::MOVE_RIGHT;
+        if(dx > 0.0)
+            return AlignmentStatus::MOVE_LEFT;
+        else
+            return AlignmentStatus::MOVE_RIGHT;
     }
-    else if(measurement.centerMM.x > targetCenterX + CENTER_TOLERANCE_MM)
+    else
     {
-        return AlignmentStatus::MOVE_LEFT;
+        if(dy > 0.0)
+            return AlignmentStatus::MOVE_UP;
+        else
+            return AlignmentStatus::MOVE_DOWN;
     }
-    else if(measurement.centerMM.y < targetCenterY - CENTER_TOLERANCE_MM)
-    {
-        return AlignmentStatus::MOVE_DOWN;
-    }
-    else if(measurement.centerMM.y > targetCenterY + CENTER_TOLERANCE_MM)
-    {
-        return AlignmentStatus::MOVE_UP;
-    }
+}
 
     double nominalAvg  = (selectedModel.widthMM + selectedModel.heightMM) / 2.0;
     double measuredAvg = (measurement.widthMM   + measurement.heightMM)   / 2.0;
@@ -1186,14 +1320,14 @@ AlignmentStatus updateAlignmentStatus(
     {
         return AlignmentStatus::MOVE_BACKWARD;
     }
-    else if(measurement.roll > ANGLE_TOLERANCE_DEG)
-    {
-        return AlignmentStatus::ROTATE_CCW;
-    }
-    else if(measurement.roll < -ANGLE_TOLERANCE_DEG)
-    {
-        return AlignmentStatus::ROTATE_CW;
-    }
+    else if(measurement.rotationDeg > ANGLE_TOLERANCE_DEG)
+{
+    return AlignmentStatus::ROTATE_CCW;
+}
+else if(measurement.rotationDeg < -ANGLE_TOLERANCE_DEG)
+{
+    return AlignmentStatus::ROTATE_CW;
+}
 
     return AlignmentStatus::OK;
 }
@@ -1209,8 +1343,14 @@ std::string formatAlignmentDetail(
 {
     char buf[128];
 
-    double targetCenterX = selectedModel.widthMM  / 2.0;
-    double targetCenterY = selectedModel.heightMM / 2.0;
+// Vida referans koordinat sisteminin fiziksel merkezi
+// TL=(0,0), TR=(222.5,0), BR=(222.5,150), BL=(0,150)
+
+constexpr double SCREW_FRAME_WIDTH_MM  = 222.5;
+constexpr double SCREW_FRAME_HEIGHT_MM = 150.0;
+
+double targetCenterX = SCREW_FRAME_WIDTH_MM  / 2.0;  // 111.25 mm
+double targetCenterY = SCREW_FRAME_HEIGHT_MM / 2.0;  // 75.00 mm
 
     double dx = measurement.centerMM.x - targetCenterX;
     double dy = measurement.centerMM.y - targetCenterY;
@@ -1223,15 +1363,18 @@ std::string formatAlignmentDetail(
 
     switch(status)
     {
-    case AlignmentStatus::MOVE_LEFT:
-    case AlignmentStatus::MOVE_RIGHT:
-        snprintf(buf, sizeof(buf), "X Offset : %+.1f mm", dx);
-        return std::string(buf);
-
-    case AlignmentStatus::MOVE_UP:
-    case AlignmentStatus::MOVE_DOWN:
-        snprintf(buf, sizeof(buf), "Y Offset : %+.1f mm", dy);
-        return std::string(buf);
+        case AlignmentStatus::MOVE_LEFT:
+        case AlignmentStatus::MOVE_RIGHT:
+        case AlignmentStatus::MOVE_UP:
+        case AlignmentStatus::MOVE_DOWN:
+            snprintf(
+                buf,
+                sizeof(buf),
+                "X:%+.1f mm  Y:%+.1f mm",
+                dx,
+                dy
+            );
+            return std::string(buf);
 
     case AlignmentStatus::MOVE_FORWARD:
     case AlignmentStatus::MOVE_BACKWARD:
@@ -1240,7 +1383,7 @@ std::string formatAlignmentDetail(
 
     case AlignmentStatus::ROTATE_CW:
     case AlignmentStatus::ROTATE_CCW:
-        snprintf(buf, sizeof(buf), "Angle Offset : %+.1f deg", measurement.roll);
+    snprintf(buf, sizeof(buf), "Angle Offset : %+.1f deg", measurement.rotationDeg);
         return std::string(buf);
 
     case AlignmentStatus::SIZE_MISMATCH:
@@ -1307,8 +1450,6 @@ public:
         double cy = medianOf([](const MeasurementData& m){ return m.centerMM.y; });
         result.centerMM = cv::Point2d(cx, cy);
 
-        // FIX: median alinirken sizeSuspicious bilgisi kaybolmasin -
-        // bufferdaki son (en guncel) ornegin bayragini tasi.
         result.sizeSuspicious = m_buffer.back().sizeSuspicious;
 
         return result;
@@ -1418,31 +1559,55 @@ bool computeTargetOverlayPixels(
     if(!homographyLoaded || invHomography.empty())
         return false;
 
+    // 4 referans vidanin olusturdugu fiziksel alan
+    constexpr float SCREW_FRAME_WIDTH_MM  = 222.5f;
+    constexpr float SCREW_FRAME_HEIGHT_MM = 150.0f;
+
+    // Vida referans alaninin merkezi
+    const float centerX = SCREW_FRAME_WIDTH_MM  / 2.0f;  // 111.25 mm
+    const float centerY = SCREW_FRAME_HEIGHT_MM / 2.0f;  // 75.00 mm
+
+    // Secilen projeksiyon modelinin yari boyutlari
+    const float halfW = model.widthMM  / 2.0f;
+    const float halfH = model.heightMM / 2.0f;
+
+    // Projeksiyon hedefini vida merkezinin etrafina yerlestir
     std::vector<cv::Point2f> worldCorners = {
-        cv::Point2f(0.0f, 0.0f),
-        cv::Point2f(model.widthMM, 0.0f),
-        cv::Point2f(model.widthMM, model.heightMM),
-        cv::Point2f(0.0f, model.heightMM)
+        cv::Point2f(centerX - halfW, centerY - halfH), // TL
+        cv::Point2f(centerX + halfW, centerY - halfH), // TR
+        cv::Point2f(centerX + halfW, centerY + halfH), // BR
+        cv::Point2f(centerX - halfW, centerY + halfH)  // BL
     };
 
-    cv::perspectiveTransform(worldCorners, outCornersPx, invHomography);
+    cv::perspectiveTransform(
+        worldCorners,
+        outCornersPx,
+        invHomography
+    );
 
     if(outCornersPx.size() != 4)
         return false;
 
+    // Hedef merkez = 4 vidanin geometrik merkezi
     std::vector<cv::Point2f> worldCenter = {
-        cv::Point2f(model.widthMM / 2.0f, model.heightMM / 2.0f)
+        cv::Point2f(centerX, centerY)
     };
+
     std::vector<cv::Point2f> centerPx;
-    cv::perspectiveTransform(worldCenter, centerPx, invHomography);
+
+    cv::perspectiveTransform(
+        worldCenter,
+        centerPx,
+        invHomography
+    );
 
     if(centerPx.empty())
         return false;
 
     outCenterPx = centerPx[0];
+
     return true;
 }
-
 //--------------------------------------------------
 // Draw Result
 //--------------------------------------------------
@@ -1783,9 +1948,861 @@ cv::Mat undistortFrame(
 // MAIN
 //--------------------------------------------------
 
+
+//==================================================
+// AUTOMATIC SCREW REFERENCE DETECTION
+//==================================================
+
+std::vector<cv::Point2f> detectScrewCandidates(
+    const cv::Mat& grayUndistorted,
+    cv::Mat& debugDisplay)
+{
+    std::vector<cv::Point2f> candidates;
+
+    if(grayUndistorted.empty())
+        return candidates;
+
+    cv::Mat blurred;
+
+    cv::GaussianBlur(
+        grayUndistorted,
+        blurred,
+        cv::Size(7, 7),
+        1.5
+    );
+
+    std::vector<cv::Vec3f> circles;
+
+    cv::HoughCircles(
+        blurred,
+        circles,
+        cv::HOUGH_GRADIENT,
+        1.2,
+        25,
+        100,
+        22,
+        5,
+        25
+    );
+
+    for(const auto& circle : circles)
+    {
+        cv::Point2f center(circle[0], circle[1]);
+        float radius = circle[2];
+
+        int x = cvRound(center.x);
+        int y = cvRound(center.y);
+
+        if(x < 0 || x >= grayUndistorted.cols ||
+           y < 0 || y >= grayUndistorted.rows)
+        {
+            continue;
+        }
+
+        //--------------------------------------------------
+        // BOYANMIS VIDA MERKEZI KONTROLU
+        //--------------------------------------------------
+        //
+        // Tek piksele bakmiyoruz.
+        // Merkezin etrafindaki kucuk dairesel alanin
+        // ortalama parlakligini hesapliyoruz.
+        //--------------------------------------------------
+
+        int sampleRadius = std::max(
+            3,
+            cvRound(radius * 0.30f)
+        );
+
+        cv::Mat centerMask = cv::Mat::zeros(
+            grayUndistorted.size(),
+            CV_8UC1
+        );
+
+        cv::circle(
+            centerMask,
+            cv::Point(x, y),
+            sampleRadius,
+            cv::Scalar(255),
+            -1
+        );
+
+        double meanIntensity =
+            cv::mean(grayUndistorted, centerMask)[0];
+
+ //--------------------------------------------------
+// VIDA GORUNUM FILTRESI
+//--------------------------------------------------
+
+// Tek bir sert kosul yerine puanlama kullaniyoruz.
+// Isik degisimlerinde gercek vidanin bir karede kaybolmasini azaltir.
+
+const double DARK_CENTER_STRONG = 100.0;
+const double DARK_CENTER_WEAK   = 135.0;
+
+const double RING_MIN_STRONG = 80.0;
+const double RING_MIN_WEAK   = 60.0;
+
+const double CONTRAST_STRONG = 20.0;
+const double CONTRAST_WEAK   = 8.0;
+
+
+//--------------------------------------------------
+// HALKA HESABI
+//--------------------------------------------------
+
+int innerRadius =
+    std::max(3, cvRound(radius * 0.45f));
+
+int outerRadius =
+    std::max(innerRadius + 2, cvRound(radius * 0.90f));
+
+cv::Mat outerMask = cv::Mat::zeros(
+    grayUndistorted.size(),
+    CV_8UC1
+);
+
+cv::Mat innerMask = cv::Mat::zeros(
+    grayUndistorted.size(),
+    CV_8UC1
+);
+
+cv::circle(
+    outerMask,
+    cv::Point(x, y),
+    outerRadius,
+    cv::Scalar(255),
+    -1
+);
+
+cv::circle(
+    innerMask,
+    cv::Point(x, y),
+    innerRadius,
+    cv::Scalar(255),
+    -1
+);
+
+cv::subtract(
+    outerMask,
+    innerMask,
+    outerMask
+);
+
+double ringMean =
+    cv::mean(grayUndistorted, outerMask)[0];
+
+double contrast =
+    ringMean - meanIntensity;
+
+
+//--------------------------------------------------
+// PUANLAMA
+//--------------------------------------------------
+
+int appearanceScore = 0;
+
+// Merkez ne kadar koyu?
+if(meanIntensity < DARK_CENTER_STRONG)
+    appearanceScore += 2;
+else if(meanIntensity < DARK_CENTER_WEAK)
+    appearanceScore += 1;
+
+// Metal halka yeterince parlak mi?
+if(ringMean > RING_MIN_STRONG)
+    appearanceScore += 2;
+else if(ringMean > RING_MIN_WEAK)
+    appearanceScore += 1;
+
+// Merkez ile halka arasinda kontrast var mi?
+if(contrast > CONTRAST_STRONG)
+    appearanceScore += 2;
+else if(contrast > CONTRAST_WEAK)
+    appearanceScore += 1;
+
+
+//--------------------------------------------------
+// SON KARAR
+//--------------------------------------------------
+
+// Maksimum puan = 6.
+// 3 ve uzeri vida adayi olarak kabul edilir.
+bool accepted = appearanceScore >= 3;
+
+
+//--------------------------------------------------
+// DEBUG
+//--------------------------------------------------
+
+std::cout
+    << "[VIDA ADAY]"
+    << " x=" << x
+    << " y=" << y
+    << " r=" << radius
+    << " center=" << meanIntensity
+    << " ring=" << ringMean
+    << " contrast=" << contrast
+    << " score=" << appearanceScore
+    << (accepted ? " -> KABUL" : " -> RED")
+    << std::endl;
+
+//--------------------------------------------------
+// DEBUG
+//--------------------------------------------------
+
+std::cout
+    << "[VIDA ADAY]"
+    << " x=" << x
+    << " y=" << y
+    << " r=" << radius
+    << " center=" << meanIntensity
+    << " ring=" << ringMean
+    << " contrast=" << contrast
+    << (accepted ? " -> KABUL" : " -> RED")
+    << std::endl;
+
+
+if(!accepted)
+    continue;
+
+candidates.push_back(center);
+
+       
+        //--------------------------------------------------
+        // Kabul edilen adaylari sari ciz
+        //--------------------------------------------------
+
+        cv::circle(
+            debugDisplay,
+            center,
+            cvRound(radius),
+            cv::Scalar(0, 255, 255),
+            2
+        );
+
+        // Gercek Hough merkezi
+        cv::circle(
+            debugDisplay,
+            center,
+            3,
+            cv::Scalar(0, 0, 255),
+            -1
+        );
+
+        // Koyuluk olctugumuz alan
+        cv::circle(
+            debugDisplay,
+            center,
+            sampleRadius,
+            cv::Scalar(255, 0, 255),
+            1
+        );
+    }
+
+    return candidates;
+}
+//--------------------------------------------------
+// Adaylar arasindan en uygun 4 referans vidasini sec
+//--------------------------------------------------
+
+bool selectBestScrewQuad(
+    const std::vector<cv::Point2f>& candidates,
+    std::vector<cv::Point2f>& bestQuad)
+{
+    bestQuad.clear();
+
+    if(candidates.size() < 4)
+        return false;
+
+    const double expectedRatio =
+        static_cast<double>(SCREW_WIDTH_MM) /
+        static_cast<double>(SCREW_HEIGHT_MM);
+
+    double bestScore = std::numeric_limits<double>::max();
+
+    //--------------------------------------------------
+    // Tum 4'lu kombinasyonlari dene
+    //--------------------------------------------------
+
+    for(size_t a = 0; a < candidates.size() - 3; a++)
+    {
+        for(size_t b = a + 1; b < candidates.size() - 2; b++)
+        {
+            for(size_t c = b + 1; c < candidates.size() - 1; c++)
+            {
+                for(size_t d = c + 1; d < candidates.size(); d++)
+                {
+                    std::vector<cv::Point2f> pts = {
+                        candidates[a],
+                        candidates[b],
+                        candidates[c],
+                        candidates[d]
+                    };
+
+                    //--------------------------------------------------
+                    // Noktalari TL, TR, BR, BL olarak sirala
+                    //--------------------------------------------------
+
+                    cv::Point2f center(0.0f, 0.0f);
+
+                    for(const auto& p : pts)
+                        center += p;
+
+                    center *= 0.25f;
+
+                    std::vector<cv::Point2f> top;
+                    std::vector<cv::Point2f> bottom;
+
+                    for(const auto& p : pts)
+                    {
+                        if(p.y < center.y)
+                            top.push_back(p);
+                        else
+                            bottom.push_back(p);
+                    }
+
+                    // 2 ust + 2 alt nokta bekliyoruz
+                    if(top.size() != 2 || bottom.size() != 2)
+                        continue;
+
+                    std::sort(
+                        top.begin(),
+                        top.end(),
+                        [](const cv::Point2f& p1,
+                           const cv::Point2f& p2)
+                        {
+                            return p1.x < p2.x;
+                        }
+                    );
+
+                    std::sort(
+                        bottom.begin(),
+                        bottom.end(),
+                        [](const cv::Point2f& p1,
+                           const cv::Point2f& p2)
+                        {
+                            return p1.x < p2.x;
+                        }
+                    );
+
+                    std::vector<cv::Point2f> ordered = {
+                        top[0],       // TL
+                        top[1],       // TR
+                        bottom[1],    // BR
+                        bottom[0]     // BL
+                    };
+
+                    //--------------------------------------------------
+                    // Kenar uzunluklari
+                    //--------------------------------------------------
+
+                    double topWidth =
+                        cv::norm(ordered[0] - ordered[1]);
+
+                    double rightHeight =
+                        cv::norm(ordered[1] - ordered[2]);
+
+                    double bottomWidth =
+                        cv::norm(ordered[2] - ordered[3]);
+
+                    double leftHeight =
+                        cv::norm(ordered[3] - ordered[0]);
+
+                    if(topWidth < 1.0 ||
+                       bottomWidth < 1.0 ||
+                       rightHeight < 1.0 ||
+                       leftHeight < 1.0)
+                    {
+                        continue;
+                    }
+
+                    double avgWidth =
+                        (topWidth + bottomWidth) / 2.0;
+
+                    double avgHeight =
+                        (leftHeight + rightHeight) / 2.0;
+
+                    double measuredRatio =
+                        avgWidth / avgHeight;
+
+                    //--------------------------------------------------
+                    // 1) Fiziksel en/boy oranina yakinlik
+                    //--------------------------------------------------
+
+                    double ratioError =
+                        std::abs(measuredRatio - expectedRatio) /
+                        expectedRatio;
+
+                    //--------------------------------------------------
+                    // 2) Ust ve alt kenar birbirine benzemeli
+                    //--------------------------------------------------
+
+                    double widthAsym =
+                        std::abs(topWidth - bottomWidth) /
+                        std::max(topWidth, bottomWidth);
+
+                    //--------------------------------------------------
+                    // 3) Sol ve sag kenar birbirine benzemeli
+                    //--------------------------------------------------
+
+                    double heightAsym =
+                        std::abs(leftHeight - rightHeight) /
+                        std::max(leftHeight, rightHeight);
+
+                    //--------------------------------------------------
+                    // 4) Kosegenler birbirine yakin olmali
+                    //--------------------------------------------------
+
+                    double diag1 =
+                        cv::norm(ordered[0] - ordered[2]);
+
+                    double diag2 =
+                        cv::norm(ordered[1] - ordered[3]);
+
+                    double diagAsym =
+                        std::abs(diag1 - diag2) /
+                        std::max(diag1, diag2);
+
+                    //--------------------------------------------------
+                    // Cok bozuk dortgenleri direkt ele
+                    //--------------------------------------------------
+
+                    if(ratioError > 0.30)
+                        continue;
+
+                    if(widthAsym > 0.20)
+                        continue;
+
+                    if(heightAsym > 0.20)
+                        continue;
+
+                    if(diagAsym > 0.20)
+                        continue;
+
+                    //--------------------------------------------------
+                    // Toplam skor
+                    // Dusuk skor = daha iyi referans dortgeni
+                    //--------------------------------------------------
+
+                    double score =
+                        ratioError  * 4.0 +
+                        widthAsym   * 2.0 +
+                        heightAsym  * 2.0 +
+                        diagAsym    * 1.5;
+
+                    //--------------------------------------------------
+                    // Daha buyuk dortgeni hafif tercih et
+                    //
+                    // Boylece birbirine yakin 4 kucuk vida yerine
+                    // kasanin 4 kosesindeki referans vidalarinin
+                    // secilme ihtimali artar.
+                    //--------------------------------------------------
+
+                    double area =
+                        std::abs(
+                            cv::contourArea(
+                                std::vector<cv::Point2f>{
+                                    ordered[0],
+                                    ordered[1],
+                                    ordered[2],
+                                    ordered[3]
+                                }
+                            )
+                        );
+
+                    if(area > 1.0)
+                        score -= std::min(area / 1000000.0, 0.25);
+
+                    if(score < bestScore)
+                    {
+                        bestScore = score;
+                        bestQuad = ordered;
+                    }
+                }
+            }
+        }
+    }
+
+    if(bestQuad.size() != 4)
+        return false;
+
+    std::cout
+        << "[AUTO] En iyi vida dortlusu bulundu."
+        << " Score = "
+        << bestScore
+        << std::endl;
+
+    return true;
+}
+
+//--------------------------------------------------
+// Dortgen gecerlilik kontrolu (yanlis vida secimine karsi)
+//--------------------------------------------------
+bool sanityCheckQuad(const std::vector<cv::Point2f>& ordered, std::string& reason)
+{
+    double d01 = cv::norm(ordered[0] - ordered[1]);
+    double d12 = cv::norm(ordered[1] - ordered[2]);
+    double d23 = cv::norm(ordered[2] - ordered[3]);
+    double d30 = cv::norm(ordered[3] - ordered[0]);
+
+    double diag02 = cv::norm(ordered[0] - ordered[2]);
+    double diag13 = cv::norm(ordered[1] - ordered[3]);
+
+    double widthAsym  = std::abs(d01 - d23) / std::max(d01, d23);
+    double heightAsym = std::abs(d12 - d30) / std::max(d12, d30);
+    double diagAsym   = std::abs(diag02 - diag13) / std::max(diag02, diag13);
+
+    double expectedRatio = SCREW_WIDTH_MM / SCREW_HEIGHT_MM;
+    double measuredRatio = ((d01 + d23) / 2.0) / ((d12 + d30) / 2.0);
+    double ratioErrPct = std::abs(measuredRatio - expectedRatio) / expectedRatio * 100.0;
+
+    if(widthAsym > 0.15 || heightAsym > 0.15)
+    {
+        reason = "Karsit kenarlar arasinda buyuk asimetri - bir ROI yanlis vidaya kaymis olabilir.";
+        return false;
+    }
+    if(diagAsym > 0.15)
+    {
+        reason = "Kosegenler arasinda buyuk fark - dortgen carpik.";
+        return false;
+    }
+    if(ratioErrPct > 20.0)
+    {
+        reason = "Olculen en/boy orani beklenenden cok sapiyor (%" + std::to_string(int(ratioErrPct)) + ").";
+        return false;
+    }
+    return true;
+}
+//--------------------------------------------------
+// AUTO SCREW HOMOGRAPHY
+//--------------------------------------------------
+
+bool autoCalibrateScrewHomography(
+    cv::VideoCapture& cap,
+    const cv::Mat& cameraMatrix,
+    const cv::Mat& distCoeffs,
+    bool calibrationLoaded,
+    cv::Mat& outHomography)
+{
+    std::cout << "\n=== OTOMATIK VIDA REFERANSI ===\n"
+              << "4 referans vida kameradan araniyor...\n";
+
+    const int REQUIRED_GOOD_FRAMES = 8;
+    const double MAX_POINT_JUMP_PX = 15.0;
+
+    int goodFrames = 0;
+
+    // Tek bir kotu kare tum stabiliteyi bozmasin.
+    // Arka arkaya en fazla 3 kotu kareyi tolere ediyoruz.
+    int missedFrames = 0;
+    const int MAX_MISSED_FRAMES_AUTO = 3;
+    
+    std::vector<cv::Point2f> previousQuad;
+    std::vector<cv::Point2f> accumulated(4, cv::Point2f(0.0f, 0.0f));
+
+    cv::namedWindow("Auto Screw Reference", cv::WINDOW_NORMAL);
+
+    while(goodFrames < REQUIRED_GOOD_FRAMES)
+    {
+        cv::Mat frame;
+        cap >> frame;
+
+        if(frame.empty())
+        {
+            std::cerr << "[HATA] Vida referansi icin kamera karesi alinamadi.\n";
+            cv::destroyWindow("Auto Screw Reference");
+            return false;
+        }
+
+        //--------------------------------------------------
+        // ScrewDetection ile ayni koordinat sistemi
+        //--------------------------------------------------
+
+        if(calibrationLoaded)
+        {
+            cv::Mat corrected;
+            cv::undistort(frame, corrected, cameraMatrix, distCoeffs);
+            frame = corrected;
+        }
+
+        cv::Mat gray;
+        cv::cvtColor(frame, gray, cv::COLOR_BGR2GRAY);
+
+        cv::Mat display = frame.clone();
+
+        //--------------------------------------------------
+        // Vida adaylarini bul
+        //--------------------------------------------------
+
+        std::vector<cv::Point2f> candidates =
+            detectScrewCandidates(gray, display);
+
+        std::vector<cv::Point2f> quad;
+
+        bool found =
+            selectBestScrewQuad(candidates, quad);
+
+        bool accepted = found && quad.size() == 4;
+
+        //--------------------------------------------------
+        // Geometrik sanity check
+        //--------------------------------------------------
+
+        if(accepted)
+        {
+            std::string reason;
+
+            if(!sanityCheckQuad(quad, reason))
+            {
+                accepted = false;
+            }
+        }
+
+        //--------------------------------------------------
+        // Bir onceki kareyle ayni dortgen mi?
+        //--------------------------------------------------
+
+        if(accepted && !previousQuad.empty())
+        {
+            for(int i = 0; i < 4; i++)
+            {
+                double jump =
+                    cv::norm(quad[i] - previousQuad[i]);
+
+                if(jump > MAX_POINT_JUMP_PX)
+                {
+                    accepted = false;
+                    break;
+                }
+            }
+        }
+
+        //--------------------------------------------------
+        // Kabul edilen kare
+        //--------------------------------------------------
+
+        if(accepted)
+        {
+            missedFrames = 0;
+        
+            if(goodFrames == 0)
+            {
+                for(int i = 0; i < 4; i++)
+                    accumulated[i] = cv::Point2f(0.0f, 0.0f);
+            }
+
+            for(int i = 0; i < 4; i++)
+                accumulated[i] += quad[i];
+
+            previousQuad = quad;
+
+            goodFrames++;
+
+            //--------------------------------------------------
+            // Ekranda referans dortgenini goster
+            //--------------------------------------------------
+
+            for(int i = 0; i < 4; i++)
+            {
+                cv::circle(
+                    display,
+                    quad[i],
+                    8,
+                    cv::Scalar(0,255,0),
+                    -1
+                );
+
+                cv::putText(
+                    display,
+                    SCREW_NAMES[i],
+                    quad[i] + cv::Point2f(10,-10),
+                    cv::FONT_HERSHEY_SIMPLEX,
+                    0.65,
+                    cv::Scalar(0,255,0),
+                    2
+                );
+
+                cv::line(
+                    display,
+                    quad[i],
+                    quad[(i+1)%4],
+                    cv::Scalar(0,255,0),
+                    2
+                );
+            }
+        }
+        else
+{
+    //--------------------------------------------------
+    // Bu karede vida dortlusu bulunamadi.
+    //
+    // Tek bir kotu frame geldiginde onceki iyi
+    // tespitleri atmiyoruz. Bir kac kotu frame'i
+    // tolere ediyoruz.
+    //--------------------------------------------------
+
+    missedFrames++;
+
+    std::cout
+        << "[AUTO] Gecici vida kaybi: "
+        << missedFrames
+        << "/"
+        << MAX_MISSED_FRAMES_AUTO
+        << std::endl;
+
+    //--------------------------------------------------
+    // Ancak uzun sure bulunamazsa stabiliteyi sifirla.
+    //--------------------------------------------------
+
+    if(missedFrames > MAX_MISSED_FRAMES_AUTO)
+    {
+        std::cout
+            << "[AUTO] Vida referansi uzun sure kayip. "
+            << "Stabilite yeniden baslatiliyor."
+            << std::endl;
+
+        goodFrames = 0;
+        missedFrames = 0;
+
+        previousQuad.clear();
+
+        for(int i = 0; i < 4; i++)
+            accumulated[i] = cv::Point2f(0.0f, 0.0f);
+    }
+}
+
+        //--------------------------------------------------
+        // Durum bilgisi
+        //--------------------------------------------------
+
+        std::string status =
+            "Vida referansi: " +
+            std::to_string(goodFrames) +
+            "/" +
+            std::to_string(REQUIRED_GOOD_FRAMES);
+
+        cv::putText(
+            display,
+            status,
+            cv::Point(20,35),
+            cv::FONT_HERSHEY_SIMPLEX,
+            0.75,
+            accepted
+                ? cv::Scalar(0,255,0)
+                : cv::Scalar(0,0,255),
+            2
+        );
+
+        cv::imshow("Auto Screw Reference", display);
+
+        int key = cv::waitKey(30);
+
+        if(key == 27)
+        {
+            cv::destroyWindow("Auto Screw Reference");
+            return false;
+        }
+    }
+
+    //--------------------------------------------------
+    // 8 karenin ortalama vida merkezleri
+    //--------------------------------------------------
+
+    std::vector<cv::Point2f> screwPoints(4);
+
+    for(int i = 0; i < 4; i++)
+        screwPoints[i] =
+            accumulated[i] / static_cast<float>(REQUIRED_GOOD_FRAMES);
+
+    //--------------------------------------------------
+    // Fiziksel vida koordinat sistemi
+    //
+    // TL = 0,0
+    // TR = 222.5,0
+    // BR = 222.5,150
+    // BL = 0,150
+    //--------------------------------------------------
+
+    std::vector<cv::Point2f> worldPoints = {
+        {0.0f,             0.0f},
+        {SCREW_WIDTH_MM,   0.0f},
+        {SCREW_WIDTH_MM,   SCREW_HEIGHT_MM},
+        {0.0f,             SCREW_HEIGHT_MM}
+    };
+
+    outHomography =
+        cv::findHomography(screwPoints, worldPoints);
+
+    if(outHomography.empty())
+    {
+        std::cerr
+            << "[HATA] Otomatik vida homografisi hesaplanamadi.\n";
+
+        cv::destroyWindow("Auto Screw Reference");
+        return false;
+    }
+
+    //--------------------------------------------------
+    // Son kontrol: bulunan vidalar gercek dunya
+    // koordinatlarina geri projekte ediliyor.
+    //--------------------------------------------------
+
+    std::vector<cv::Point2f> projected;
+
+    cv::perspectiveTransform(
+        screwPoints,
+        projected,
+        outHomography
+    );
+
+    double error = 0.0;
+
+    for(int i = 0; i < 4; i++)
+        error += cv::norm(projected[i] - worldPoints[i]);
+
+    error /= 4.0;
+
+    std::cout
+        << "[AUTO] Vida homography olusturuldu.\n"
+        << "[AUTO] Ortalama reprojeksiyon hatasi: "
+        << error
+        << " mm\n";
+
+    //--------------------------------------------------
+    // Referans merkezini de yazdir
+    //--------------------------------------------------
+
+    cv::Point2f screwCenterPx(0.0f, 0.0f);
+
+    for(const auto& p : screwPoints)
+        screwCenterPx += p;
+
+    screwCenterPx *= 0.25f;
+
+    std::cout
+        << "[AUTO] Vida merkezi PIXEL = ("
+        << screwCenterPx.x << ", "
+        << screwCenterPx.y << ")\n"
+        << "[AUTO] Vida merkezi MM = ("
+        << SCREW_WIDTH_MM / 2.0f << ", "
+        << SCREW_HEIGHT_MM / 2.0f << ")\n";
+
+    cv::destroyWindow("Auto Screw Reference");
+
+    return true;
+}
+
+//==================================================
+// END AUTOMATIC SCREW REFERENCE DETECTION
+//==================================================
+
 int main()
 {
     cv::VideoCapture cap(0);
+    std::cout << "Camera WIDTH  = "
+    << cap.get(cv::CAP_PROP_FRAME_WIDTH) << std::endl;
+
+std::cout << "Camera HEIGHT = "
+    << cap.get(cv::CAP_PROP_FRAME_HEIGHT) << std::endl;
 
     if(!cap.isOpened())
     {
@@ -1793,6 +2810,17 @@ int main()
         return -1;
     }
 
+    // FIX (optimizasyon): Otomatik pozlama/beyaz dengesi acik oldugu surece
+    // kamera her karede kendi V/S seviyelerini kaydirabilir - bu da HSV
+    // esiklemesinin (sabit ya da adaptif) gun be gun/an be an farkli sonuc
+    // vermesine yol acar. Sabit exposure/WB, adaptif Otsu esiginin daha
+    // KARARLI calismasini saglar. NOT: bu ayarlar platforma/backend'e
+    // (V4L2, AVFoundation, DirectShow) gore farkli davranabilir veya
+    // yoksayilabilir; deger uygulanamazsa sessizce yoksayilir.
+    cap.set(cv::CAP_PROP_AUTO_EXPOSURE, 0.25);   // bazi backend'lerde 0=manuel, 1=otomatik
+    cap.set(cv::CAP_PROP_AUTO_WB, 0);
+
+    
     cv::Mat cameraMatrix = cv::Mat::eye(3, 3, CV_64F);
     cv::Mat distCoeffs   = cv::Mat::zeros(5, 1, CV_64F);
 
@@ -1806,16 +2834,56 @@ int main()
         distCoeffs   = cv::Mat::zeros(5, 1, CV_64F);
     }
 
-    cv::Mat homographyMatrix;
-    bool homographyLoaded =
-        loadHomography("homography.yml", homographyMatrix);
+   //--------------------------------------------------
+// HOMOGRAPHY
+// Once kameradan 4 referans vidayi otomatik bul.
+// Basarisiz olursa eski screw_homography.yml kullan.
+//--------------------------------------------------
 
-    if(!homographyLoaded)
-    {
-        std::cout << "[UYARI] Homografi yok, mm olcumu yapilamayacak. "
-                  << "Once ./Homography programini calistirin." << std::endl;
-    }
+cv::Mat homographyMatrix;
 
+bool homographyLoaded = false;
+
+std::cout
+    << "\n[BILGI] 4 referans vida otomatik araniyor..."
+    << std::endl;
+
+bool autoHomographyOK =
+    autoCalibrateScrewHomography(
+        cap,
+        cameraMatrix,
+        distCoeffs,
+        calibrationLoaded,
+        homographyMatrix
+    );
+
+if(autoHomographyOK)
+{
+    homographyLoaded = true;
+
+    std::cout
+        << "[BILGI] Homography CANLI vida tespitinden olusturuldu."
+        << std::endl;
+}
+else
+{
+ 
+    //--------------------------------------------------
+    // ASAMA 1 BASARISIZ.
+    // Eski homography ile devam ETME.
+    // Vida referansi bulunmadan olcum asamasina gecilmez.
+    //--------------------------------------------------
+
+    std::cerr
+        << "\n[HATA] 4 referans vida stabil olarak tespit edilemedi."
+        << "\n[HATA] ASAMA 2 BASLATILMAYACAK."
+        << "\n       Program sonlandiriliyor."
+        << std::endl;
+
+    cap.release();
+    cv::destroyAllWindows();
+    return -1;
+}
     cv::Mat invHomographyMatrix;
 
     if(homographyLoaded && !homographyMatrix.empty())
@@ -1829,24 +2897,40 @@ int main()
         }
     }
 
-    DLPModel selectedModel = selectDLPModel();
+    // FIX (YENI): daha once bulunmus HSV ayarlarini dosyadan yukle -
+    // program her acildiginda trackbar'lari sifirdan ayarlama ihtiyacini
+    // ortadan kaldirir. Dosya yoksa (ilk calistirma) varsayilan degerler
+    // (g_hMin=100 vb.) kullanilir.
+    loadHsvSettings("hsv_settings.yml", g_hMin, g_hMax, g_sMin, g_sMax, g_vMin, g_vMax);
 
-    TestPatternType selectedPattern = selectTestPattern();
+   //--------------------------------------------------
+// SABIT DLP MODELI
+// Sistem su an yalnizca 134.4 x 75.6 mm
+// beyaz dikdortgen ile otomatik calisiyor.
+//--------------------------------------------------
 
-    if(selectedPattern != TestPatternType::WHITE_RECTANGLE)
-    {
-        std::cout << "[UYARI] Secilen test deseni icin tespit algoritmasi henuz "
-                  << "uygulanmadi. WHITE_RECTANGLE (tam beyaz dikdortgen) "
-                  << "tespiti kullanilacak." << std::endl;
-        selectedPattern = TestPatternType::WHITE_RECTANGLE;
-    }
+DLPModel selectedModel = g_dlpModels[3];
+
+TestPatternType selectedPattern =
+    TestPatternType::WHITE_RECTANGLE;
+
+std::cout
+    << "\n[BILGI] Sabit DLP modeli otomatik secildi: "
+    << selectedModel.name
+    << std::endl;
+
+std::cout
+    << "[BILGI] Test deseni: Tam beyaz dikdortgen"
+    << std::endl;
 
     std::cout << "\nSecilen model: " << selectedModel.name << std::endl;
     std::cout << "Baslatiliyor...\n"
               << "  'v' detayli log   's' screenshot   'e' CSV export   ESC cikis\n"
-              << "  'm' tespit modunu degistir (HSV Renk Araligi / Parlaklik Esigi)\n"
+              << "  'm' tespit modunu degistir (Adaptif HSV / Sabit HSV / Parlaklik Esigi)\n"
               << "  'i' ICERI (pattern) HSV ornegi topla   'o' DISARI (arka plan) HSV ornegi topla\n"
-              << "  'r' toplanan orneklerden onerilen HSV araligini yazdir\n" << std::endl;
+              << "  'r' toplanan orneklerden onerilen HSV araligini yazdir\n"
+              << "  'a' pattern'den otomatik Hue bandi kalibre et (isik ekranda gorunur olmali)\n"
+              << "  'p' guncel HSV ayarlarini kaydet (hsv_settings.yml) - cikiste otomatik da kaydedilir\n" << std::endl;
 
     if(homographyLoaded)
     {
@@ -1854,7 +2938,7 @@ int main()
 
         if(!probeFrame.empty())
         {
-            DLPModel largestModel = g_dlpModels.back();
+            DLPModel largestModel = selectedModel;
 
             std::vector<cv::Point2f> probeCorners;
             cv::Point2f probeCenter;
@@ -1893,20 +2977,14 @@ int main()
 
     cv::namedWindow("Mask (debug)");
     cv::createTrackbar("Threshold (Brightness)", "Mask (debug)", &g_thresholdValue, 255);
-    cv::createTrackbar("H min", "Mask (debug)", &g_hMin, 104);
-    cv::createTrackbar("H max", "Mask (debug)", &g_hMax, 120);
-    cv::createTrackbar("S min", "Mask (debug)", &g_sMin, 60);
-    cv::createTrackbar("S max", "Mask (debug)", &g_sMax, 169);
-    cv::createTrackbar("V min", "Mask (debug)", &g_vMin, 230);
-    cv::createTrackbar("V max", "Mask (debug)", &g_vMax, 255);
+    cv::createTrackbar("H min", "Mask (debug)", &g_hMin, 179);
+    cv::createTrackbar("H max", "Mask (debug)", &g_hMax, 179);
+    cv::createTrackbar("S min", "Mask (debug)", &g_sMin, 255);
+    cv::createTrackbar("S max", "Mask (debug)", &g_sMax, 255);
+    cv::createTrackbar("V min (sabit modda / Otsu tabani)", "Mask (debug)", &g_vMin, 255);
+    cv::createTrackbar("V max (manuel modda)", "Mask (debug)", &g_vMax, 255);
     cv::moveWindow("Mask (debug)", 900, 50);
 
-    // FIX: kalibrasyon icin kullanilan mouse callback TEK SEFER, dongu
-    // DISINDA kaydediliyor; asagidaki calibState.hsvFrame'in adresi
-    // program boyunca SABIT kalir (dongu icinde sadece ICERIGI guncellenir,
-    // yeniden olusturulmaz) - onceki "sarkan pointer" hatasi boylece
-    // kalici olarak cozuldu (bkz. dosya basindaki HSV Kalibrasyon Araci
-    // yorumu).
     HsvCalibState calibState;
     cv::namedWindow("Machine Vision");
     cv::setMouseCallback("Machine Vision", hsvCalibMouseCallback, &calibState);
@@ -1919,6 +2997,7 @@ int main()
     while(true)
     {
         cv::Mat frame = captureFrame(cap);
+ 
 
         if(frame.empty())
             break;
@@ -1935,11 +3014,16 @@ int main()
 
         cv::Mat mask;
 
-        if(g_detectionMode == DetectionMode::HSV_COLOR_RANGE)
+        if(g_detectionMode == DetectionMode::HSV_ADAPTIVE)
         {
-            // ONEMLI: calibState.hsvFrame'in ICERIGINI guncelliyoruz, kendisini
-            // yeniden OLUSTURMUYORUZ - boylece mouse callback'in tuttugu adres
-            // her zaman GECERLI ve GUNCEL kalir.
+            cv::cvtColor(frame, calibState.hsvFrame, cv::COLOR_BGR2HSV);
+            // g_vMin buradaki tabani (Otsu'nun ALTINA dusemeyecegi minimum) belirliyor -
+            // trackbar'dan elle dogruladiginiz iyi degeri (once bulunan ~110-140 gibi)
+            // burada girerseniz Otsu artik daha gevsek bir esik secemez.
+            mask = detectColorRegionAdaptive(calibState.hsvFrame, g_hMin, g_hMax, g_sMin, g_vMin, g_lastOtsuVThresh);
+        }
+        else if(g_detectionMode == DetectionMode::HSV_COLOR_RANGE)
+        {
             cv::cvtColor(frame, calibState.hsvFrame, cv::COLOR_BGR2HSV);
             mask = detectColorRegion(calibState.hsvFrame, g_hMin, g_hMax, g_sMin, g_sMax, g_vMin, g_vMax);
         }
@@ -1968,10 +3052,6 @@ int main()
             calibrationLoaded,
             selectedModel);
 
-        // FIX: supheli (nominal boyuttan cok sapan) bir olcum, gecmis
-        // (history) tamponuna GECERLI diye eklenip medyanla "yikanip"
-        // gizlenmesin - boylece operator SIZE_MISMATCH uyarisini gorup
-        // homografiyi/kurulumu kontrol etmeye zorlanir.
         history.push(rawMeasurement);
 
         MeasurementData displayMeasurement;
@@ -2021,11 +3101,20 @@ int main()
                 cameraConnected,
                 calibrationLoaded);
 
-        // Aktif tespit modunu videonun sol-ustune yaz (Adim: saha testi
-        // sirasinda hangi yontemin aktif oldugu her zaman gorunur olsun).
-        std::string modeText = (g_detectionMode == DetectionMode::HSV_COLOR_RANGE)
-            ? "Mode: HSV Renk Araligi (m: degistir, i/o/r: kalibrasyon)"
-            : "Mode: Parlaklik Esigi (m: degistir)";
+        std::string modeText;
+        switch(g_detectionMode)
+        {
+        case DetectionMode::HSV_ADAPTIVE:
+            modeText = "Mode: Adaptif HSV (Otsu V esigi: " + std::to_string(g_lastOtsuVThresh) +
+                       ")  (m: degistir, a: Hue kalibre et, i/o/r: manuel kalibrasyon)";
+            break;
+        case DetectionMode::HSV_COLOR_RANGE:
+            modeText = "Mode: Sabit HSV Renk Araligi (m: degistir, i/o/r: kalibrasyon)";
+            break;
+        default:
+            modeText = "Mode: Parlaklik Esigi (m: degistir)";
+            break;
+        }
         cv::putText(result, modeText, cv::Point(20, 30), cv::FONT_HERSHEY_SIMPLEX, 0.55, cv::Scalar(0,255,255), 2);
 
         cv::imshow("Machine Vision", result);
@@ -2043,13 +3132,40 @@ int main()
         }
         else if(key == 'm' || key == 'M')
         {
-            g_detectionMode = (g_detectionMode == DetectionMode::HSV_COLOR_RANGE)
-                ? DetectionMode::BRIGHTNESS_THRESHOLD
-                : DetectionMode::HSV_COLOR_RANGE;
+            // Adaptif -> Sabit HSV -> Parlaklik Esigi -> (basa don)
+            if(g_detectionMode == DetectionMode::HSV_ADAPTIVE)
+                g_detectionMode = DetectionMode::HSV_COLOR_RANGE;
+            else if(g_detectionMode == DetectionMode::HSV_COLOR_RANGE)
+                g_detectionMode = DetectionMode::BRIGHTNESS_THRESHOLD;
+            else
+                g_detectionMode = DetectionMode::HSV_ADAPTIVE;
 
-            std::cout << "[BILGI] Tespit modu: "
-                      << (g_detectionMode == DetectionMode::HSV_COLOR_RANGE ? "HSV Renk Araligi" : "Parlaklik Esigi")
-                      << std::endl;
+            std::string modeName =
+                (g_detectionMode == DetectionMode::HSV_ADAPTIVE)     ? "Adaptif HSV (Otsu)" :
+                (g_detectionMode == DetectionMode::HSV_COLOR_RANGE)  ? "Sabit HSV Renk Araligi" :
+                                                                        "Parlaklik Esigi";
+
+            std::cout << "[BILGI] Tespit modu: " << modeName << std::endl;
+        }
+        else if(key == 'a' || key == 'A')
+        {
+            // YENI: pattern ekrandayken Hue bandini otomatik kalibre et.
+            cv::Mat hsvNow;
+            cv::cvtColor(frame, hsvNow, cv::COLOR_BGR2HSV);
+
+            int newHMin = g_hMin;
+            int newHMax = g_hMax;
+
+            if(autoCalibrateHueBand(hsvNow, newHMin, newHMax))
+            {
+                g_hMin = newHMin;
+                g_hMax = newHMax;
+
+                cv::setTrackbarPos("H min", "Mask (debug)", g_hMin);
+                cv::setTrackbarPos("H max", "Mask (debug)", g_hMax);
+
+                std::cout << "[BILGI] Hue bandi otomatik guncellendi: H[" << g_hMin << " - " << g_hMax << "]" << std::endl;
+            }
         }
         else if(key == 'i' || key == 'I')
         {
@@ -2074,6 +3190,11 @@ int main()
             calibState.outsideSamples.clear();
             calibState.collectingInside = false;
             calibState.collectingOutside = false;
+        }
+        else if(key == 'p' || key == 'P')
+        {
+            // YENI: guncel HSV trackbar/otomatik degerlerini anlik kaydet.
+            saveHsvSettings("hsv_settings.yml", g_hMin, g_hMax, g_sMin, g_sMax, g_vMin, g_vMax);
         }
         else if(key == 's' || key == 'S')
         {
@@ -2105,6 +3226,11 @@ int main()
 
     cap.release();
     cv::destroyAllWindows();
+
+    // FIX (YENI): cikiste guncel HSV ayarlarini otomatik kaydet - bir
+    // sonraki acilista elle trackbar cekmeye gerek kalmasin. 'p' ile
+    // manuel kaydetmeyi unutsaniz da program kapanirken kaydeder.
+    saveHsvSettings("hsv_settings.yml", g_hMin, g_hMax, g_sMin, g_sMax, g_vMin, g_vMax);
 
     if(!logBuffer.empty())
     {

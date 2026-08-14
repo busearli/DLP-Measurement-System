@@ -200,6 +200,12 @@ int main()
     while(static_cast<int>(g_clickedPoints.size()) < 4)
     {
         cv::Mat frame = captureFrame(cap);
+        if(!frame.empty())
+{
+    std::cout << "HOMOGRAPHY FRAME SIZE = "
+              << frame.cols << " x "
+              << frame.rows << std::endl;
+}
 
         if(frame.empty())
             break;
